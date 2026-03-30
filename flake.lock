@@ -1,0 +1,43 @@
+{
+  "nodes": {
+    "nix-types": {
+      "locked": {
+        "lastModified": 1774805688,
+        "narHash": "sha256-+rx2OtuPQI7A4SKot3M1j1GiiJzSWrkEB9V8s8zdEPA=",
+        "owner": "Redskaber",
+        "repo": "nix-types",
+        "rev": "439e85b219441d3d3475b6cffd78061217175c89",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Redskaber",
+        "repo": "nix-types",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1774709303,
+        "narHash": "sha256-D3Q07BbIA2KnTcSXIqqu9P586uWxN74zNoCH3h2ESHg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "8110df5ad7abf5d4c0f6fb0f8f978390e77f9685",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nix-types": "nix-types",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
