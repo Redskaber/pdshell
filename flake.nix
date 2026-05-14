@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url    = "github:NixOS/nixpkgs/nixos-unstable";
-    nix-types.url  = "github:redskaber/nix-types";   # provides enum
+    nix-types.url  = "github:Redskaber/nix-types";   # provides enum
     flake-utils.url = "github:numtide/flake-utils";
   };
 
