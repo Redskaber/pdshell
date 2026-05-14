@@ -21,9 +21,9 @@
       export = {
         mk-pdshell = ./lib/pdshells.nix;
         pdshells = ./lib/pdshells.nix;
-        test = import ./test { inherit inputs; pkgs = nixpkgs; };
+        devShells.x86_64-linux =
+          let pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          in import ./lib/pdshells.nix { inherit pkgs inputs; devDir = ./test/dev; };
       };
     in export;
 }
-
-
