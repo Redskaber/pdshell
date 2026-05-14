@@ -2,56 +2,105 @@
 
 ---
 
+## v2.2.0 — 2026-05-14
+
+### Bug fixes
+
+**mk-pdshell.nix**
+
+1. **`fn-assemble` lifecycle order corrected** — v2.1 rendered sections in the
+   order `INHERITED SHELLHOOK → PRE-INPUTS → POST-INPUTS → PRE-SHELL → POST-SHELL`,
+   which contradicted the documented lifecycle
+   (`preInputs → postInputs → inheritedShell → preShell → postShell`).
+   v2.2 restores the correct assembly order.
+
+2. **`fn-composePhase` first parameter clarified** — The parameter was named
+   `hookName` but was only forwarded to `fn-executeHookFn` (whose error-reporting
+   parameter was renamed `fnFieldName`). The parameter is now named `hookName`
+   with a clear comment explaining it is reserved for section-label use
+   (section labelling occurs in `fn-assemble`, not `fn-composePhase`). The
+   composition logic now correctly passes `fnFieldName` to `fn-executeHookFn`.
+
+3. **`fn-getAttrsFiles` suffix threading** — `fs.fn-getAttrsFiles` now accepts
+   `currentSuffix` explicitly instead of silently using `fs.default-nixSuffix`,
+   so the module-level `suffix` parameter propagates correctly through all
+   `FileProcessStrategy` file list lookups.
+
+4. **`shell` override documented as variant-level** — The comment and docs
+   previously implied `shell` was only honoured at the "top level" of
+   `mkDevShell`. Because `pdshells` calls `mkDevShell (variantAttrset // { name
+= ...; })`, the `shell` key in any variant config **is** forwarded and
+   honoured. Docs and test files corrected accordingly.
+
+### New features
+
+**mk-pdshell.nix**
+
+5. **`_hookComposeStrategy` extension point** — A third injectable strategy has
+   been added. The default implementation (`hookComposer.fn-defaultComposeStrategy`)
+   reproduces the v2.1 per-phase explicit composition, but callers can now
+   replace the entire hook-composition algorithm without modifying core.
+   Protocol: `args → in:[hookAttrset] → resolvedCombin:[attrset] → composedPhases`.
+   `ShellKey._hookComposeStrategy` added; the key is stripped before `pkgs.mkShell`.
+
+6. **`hookComposer.fn-defaultComposeStrategy` extracted** — The per-phase
+   composition logic previously inlined in `pipeline.fn-compose` is now a
+   named, testable function in `hookComposer`. This enables unit testing of
+   hook composition without running the full pipeline.
+
+**pdshells.nix**
+
+7. **`FileProcessStrategy.fn-getFileList` signature extended** — Now
+   `currentPath → currentSuffix → [fileName]` (was `currentPath → [fileName]`).
+   Both `CommonStrategy` and `DefaultStrategy` updated. Callers of
+   `fn-execute` pass `ctx.suffix` through the strategy.
+
+### Documentation
+
+8. **Test files rewritten** — All `test/dev/**/*.nix` files now have accurate
+   per-file headers, meaningful `buildInputs`, and demonstrate different features
+   (lifecycle hooks, shell override, combinFrom, etc.).
+
+9. **`flake.nix` added** — Full top-level flake with `lib`, `devShells`, and
+   basic `checks` output.
+
+---
+
 ## v2.1.0 — 2026-05-14
 
 ### Bug fixes
 
 **mk-pdshell.nix**
 
-1. **`inh_` → `in`** — the trailing underscore was non-idiomatic Nix and served
-   no purpose. Restored to `in` as in the original v1.
+1. **`inh_` → `in`** — trailing underscore was non-idiomatic Nix. Restored.
 
 2. **Stage 5: removed `mk` helper; restored explicit per-phase composition** —
-   the `mk` helper conflated three semantically distinct roles under a single
-   argument that happened to share the same string value in the default case
-   (`hookName`, `customFieldKey`, and `fnFieldKey` were all `"preInputsHook"`
-   for the first phase). Explicit per-phase blocks with `HookPhase.*` and
-   `HookFnField.*` constants make every argument's role unambiguous.
+   the helper conflated `hookName`, `customFieldKey`, and `fnFieldKey` which
+   happened to share the same string value in the default case.
 
-3. **`_mkShellStripKeys` now includes `ShellKey.name`** — previously `name` was
-   not stripped, so `baseParams` already contained `name` and the `// { name = ...; }`
-   in `fn-build` silently shadowed it. Now `name` is stripped first and assigned
-   exactly once. Also added `ShellKey._resolveStrategy` and `ShellKey._mergeStrategy`
-   to prevent injected strategy functions from leaking into `pkgs.mkShell`.
+3. **`_mkShellStripKeys` now includes `ShellKey.name`** — prevents silent
+   duplicate-key shadowing; `name` is now assigned exactly once.
+   Added `ShellKey._resolveStrategy` and `ShellKey._mergeStrategy`.
 
-4. **`HookPhase` and `HookFnField` constants used in pipeline stages** — both
-   protocol attrsets were defined but never referenced inside the pipeline
-   (bare string literals were used instead). All occurrences in `extractor`,
-   `hookComposer`, and `pipeline.fn-compose` now reference the protocol constants.
-   `HookFnField` added as a companion protocol to `HookPhase`.
+4. **`HookPhase` and `HookFnField` constants used throughout pipeline** — bare
+   string literals replaced. `HookFnField` added as a companion protocol.
 
 **pdshells.nix**
 
-5. **`fn-processDirectory` signature** — removed the spurious `ctx` parameter.
-   The function immediately discarded it (rebuilding via `fn-initialContext`).
-   Only `ctx.suffix` was used; replaced with an explicit `suffix: string` parameter.
+5. **`fn-processDirectory` signature** — removed spurious `ctx` parameter;
+   replaced with explicit `suffix` string.
 
-6. **`fn-processMain` forwards `validPath`** — `validate.fn-assertFileExists`
-   returns the validated path, but v2.0 piped its result and then passed the
-   original `currentPath` to `fn-processDirectory`, rendering the assertion
-   result useless. Fixed to pass `validPath`.
+6. **`fn-processMain` forwards `validPath`** — validation result was previously
+   discarded.
 
-7. **`fn-processSubDirs` passes `ctx.suffix`** — with the signature change to
-   `fn-processDirectory`, recursive calls now pass `ctx.suffix` explicitly.
+7. **`fn-processSubDirs` passes `ctx.suffix`** — consistent with signature change.
 
-8. **Global uniqueness is strictly evaluated** — replaced the `let` binding
-   (lazy, could silently be skipped) with `assert lib.seq (...) true` so the
-   uniqueness check is guaranteed to run before the shells are returned.
+8. **Global uniqueness strictly evaluated** — `let` binding replaced with
+   `assert lib.seq (...) true`.
 
 ### New exports
 
-- `HookFnField` — companion protocol to `HookPhase`; exported alongside `HookPhase`
-  and `ContextPhase` for use by consumers and tests.
+- `HookFnField` — exported alongside `HookPhase` and `ContextPhase`.
 
 ---
 

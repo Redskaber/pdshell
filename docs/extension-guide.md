@@ -1,6 +1,6 @@
 # pdshell — Extension Guide
 
-> How to extend pdshell without modifying core modules.
+> Version 2.2.0 · How to extend pdshell without modifying core modules.
 
 ---
 
@@ -8,6 +8,14 @@
 
 All extension points are injected via function parameters.
 Core modules depend on protocol contracts — not on concrete implementations.
+
+There are now **three injectable strategies** in `mkDevShell`:
+
+| Parameter              | Protocol                                      | Default                                  |
+| ---------------------- | --------------------------------------------- | ---------------------------------------- |
+| `_resolveStrategy`     | `entry:attrset → config:attrset`              | `resolveStrategy.default`                |
+| `_mergeStrategy`       | `base:[pkg] → extracted:[pkg] → merged:[pkg]` | `mergeStrategy.unique`                   |
+| `_hookComposeStrategy` | `args → in → resolvedCombin → composedPhases` | `hookComposer.fn-defaultComposeStrategy` |
 
 ---
 
@@ -19,7 +27,7 @@ Protocol: `entry:attrset → config:attrset`
 # Unwrap entries that use a non-standard "cfg" wrapper key
 myResolveStrategy = entry:
   if builtins.hasAttr "cfg" entry then entry.cfg
-  else resolveStrategy.default entry;   # fall through
+  else resolveStrategy.default entry;   # fall through to default
 
 shell = mkDevShell {
   _resolveStrategy = myResolveStrategy;
@@ -34,7 +42,7 @@ shell = mkDevShell {
 Protocol: `base:[pkg] → extracted:[pkg] → [pkg]`
 
 ```nix
-# Allow duplicates (no deduplication)
+# Allow duplicates — no deduplication
 orderedMerge = base: extracted: base ++ extracted;
 
 shell = mkDevShell {
@@ -54,7 +62,36 @@ Built-in strategies:
 
 ---
 
-## 3. Dynamic Hook Functions
+## 3. Custom Hook Compose Strategy
+
+Protocol: `args → in:[hookAttrset] → resolvedCombin:[attrset] → composedPhases`
+
+`composedPhases` must be an attrset with exactly:
+`{ preInputs, postInputs, inheritedShell, preShell, postShell }` — all strings.
+
+```nix
+# Reverse the inherited hook order (last combinFrom wins)
+reverseInheritedCompose = args: in: resolvedCombin:
+  let
+    base = hookComposer.fn-defaultComposeStrategy args in resolvedCombin;
+  in base // {
+    preInputs = hookComposer.fn-composePhase
+      "preInputsHook"
+      "preInputsHookFn"
+      (lib.reverseList (map (h: h.preInputsHook) in))
+      (args.preInputsHook or "")
+      (args.preInputsHookFn or null);
+  };
+
+shell = mkDevShell {
+  _hookComposeStrategy = reverseInheritedCompose;
+  combinFrom = [ pluginA pluginB ];
+};
+```
+
+---
+
+## 4. Dynamic Hook Functions
 
 Each `*HookFn` receives `{ pkgs }` and must return `string | null`.
 
@@ -71,7 +108,7 @@ shell = mkDevShell {
 
 ---
 
-## 4. Composing Shells via combinFrom
+## 5. Composing Shells via combinFrom
 
 ```nix
 # plugins/base.nix
@@ -108,7 +145,7 @@ shell = mkDevShell {
 
 ---
 
-## 5. Org-Wide Defaults Wrapper
+## 6. Org-Wide Defaults Wrapper
 
 ```nix
 # lib/mkOrgShell.nix
@@ -125,7 +162,7 @@ args:
 
 ---
 
-## 6. Custom File Process Strategy (pdshells)
+## 7. Custom File Process Strategy (pdshells)
 
 Add a new category of files processed alongside the built-in common/default strategies:
 
@@ -133,7 +170,7 @@ Add a new category of files processed alongside the built-in common/default stra
 SharedStrategy = layer.FileProcessStrategy.FileStrategy {
   attrType              = fs.AttrType.Common;
   targetField           = "sharedAttrs";
-  fn-getFileList        = _: [ "shared.nix" ];
+  fn-getFileList        = _path: _suffix: [ "shared.nix" ];
   fn-getSubVariantsTree = _: {};           # shared files see no prior context
   fn-validationContext  = currentPath: "SHARED FILE(${currentPath})";
   fn-aggregateVariantsTree = fileResults:
@@ -141,15 +178,37 @@ SharedStrategy = layer.FileProcessStrategy.FileStrategy {
 };
 ```
 
+Note: `fn-getFileList` now receives both `currentPath` and `currentSuffix` (v2.2+).
+
 ---
 
-## 7. Accessing Internals for Testing
+## 8. Shell Override at the Variant Level
+
+The `shell` key is honoured at the variant level because `pdshells` calls
+`mkDevShell (variantAttrset // { name = ...; })` — so any `shell` in a variant
+config is forwarded to `mkDevShell` and fully processed:
+
+```nix
+# dev/python/machine.nix
+{ pkgs, ... }:
+{
+  default = {
+    buildInputs = [ pkgs.python3 pkgs.zsh ];
+    shell       = "zsh";   # exec'd after all hooks
+  };
+}
+# → shell name "python-machine" will exec zsh after hooks run
+```
+
+---
+
+## 9. Accessing Internals for Testing
 
 `mk-pdshell.nix` exports all internal modules:
 
 ```nix
 let
-  subject = import ./lib/dev/mk-pdshell.nix { inherit pkgs; };
+  subject = import ./lib/mk-pdshell.nix { inherit pkgs; };
 in {
   # Individual module tests
   test-resolveDefault =
@@ -158,9 +217,16 @@ in {
   test-mergeUnique =
     subject.mergeStrategy.unique [ pkgs.git ] [ pkgs.git pkgs.curl ];
 
+  # Hook compose strategy test (new in v2.2)
+  test-hookCompose =
+    subject.hookComposer.fn-defaultComposeStrategy
+      { preInputsHook = "echo pre"; }
+      []     # no inherited hooks
+      [];    # no resolvedCombin
+
   # Protocol constants
-  test-hookPhase = subject.HookPhase.PRE_INPUTS;   # "preInputsHook"
-  test-hookFnField = subject.HookFnField.PRE_INPUTS; # "preInputsHookFn"
+  test-hookPhase   = subject.HookPhase.PRE_INPUTS;    # "preInputsHook"
+  test-hookFnField = subject.HookFnField.PRE_INPUTS;  # "preInputsHookFn"
 
   # Full pipeline
   test-mkDevShell = subject.mkDevShell {

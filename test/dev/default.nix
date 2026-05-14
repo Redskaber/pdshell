@@ -1,22 +1,20 @@
-# @path: ~/projects/configs/nix-config/lib/dev/default.nix
-# @description: Example top-level dev shell definitions
-# This file is imported by pdshells.nix as the "default.nix" for the root dev directory.
-# It receives:
-#   pkgs    — nixpkgs
+# @path: test/dev/default.nix
+# @description: Root dev shell definitions — loaded by pdshells as the top-level default.nix.
+#
+# Receives from pdshells:
+#   pkgs    — nixpkgs instance
 #   inputs  — flake inputs
-#   shared  — shared config passed to pdshells
-#   dev     — variantsTree of all sub-directories and common files (for combinFrom)
+#   shared  — optional shared config passed to pdshells { shared = ...; }
+#   dev     — variantsTree of all sub-directories and common files (use for combinFrom)
 
 { pkgs, inputs, shared ? {}, dev ? {}, ... }:
 {
-  # The "default" key produces shell name: "default"
-  # Additional keys produce: "rust", "go", etc.
+  # Shell name: "default"
   default = {
     buildInputs = with pkgs; [
       git
       curl
     ];
-
     shellHook = ''
       echo "Welcome to the default dev shell"
     '';

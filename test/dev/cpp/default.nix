@@ -1,24 +1,28 @@
-# @path: ~/projects/configs/nix-config/lib/dev/default.nix
-# @description: Example top-level dev shell definitions
-# This file is imported by pdshells.nix as the "default.nix" for the root dev directory.
-# It receives:
-#   pkgs    — nixpkgs
+# @path: test/dev/cpp/default.nix
+# @description: C++ sub-directory shell — loaded by pdshells as default.nix for dev/cpp/.
+#
+# Receives from pdshells:
+#   pkgs    — nixpkgs instance
 #   inputs  — flake inputs
-#   shared  — shared config passed to pdshells
-#   dev     — variantsTree of all sub-directories and common files (for combinFrom)
+#   shared  — optional shared config
+#   dev     — variantsTree including parent-level shells (for combinFrom)
 
 { pkgs, inputs, shared ? {}, dev ? {}, ... }:
 {
-  # The "default" key produces shell name: "default"
-  # Additional keys produce: "rust", "go", etc.
+  # Shell name: "cpp"  (directory name, variant "default" → omitted)
   default = {
     buildInputs = with pkgs; [
-      git
-      curl
+      gcc
+      cmake
+      ninja
+      gdb
     ];
-
+    preShellHook = ''
+      export CC=${pkgs.gcc}/bin/gcc
+      export CXX=${pkgs.gcc}/bin/g++
+    '';
     shellHook = ''
-      echo "Welcome to the default dev shell"
+      echo "C++ dev shell — gcc $(gcc --version | head -1)"
     '';
   };
 }

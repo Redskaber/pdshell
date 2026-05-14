@@ -1,25 +1,35 @@
-# @path: ~/projects/configs/nix-config/lib/dev/default.nix
-# @description: Example top-level dev shell definitions
-# This file is imported by pdshells.nix as the "default.nix" for the root dev directory.
-# It receives:
-#   pkgs    — nixpkgs
+# @path: test/dev/python/machine.nix
+# @description: Machine-learning Python shell — common file for dev/python/.
+#   File base "machine" → shell name "python-machine" (variant "default" omitted).
+#
+# Demonstrates:
+#   • postInputsHook for environment variable setup
+#   • shell override: replaces the interactive shell with zsh after all hooks run
+#
+# Receives from pdshells:
+#   pkgs    — nixpkgs instance
 #   inputs  — flake inputs
-#   shared  — shared config passed to pdshells
-#   dev     — variantsTree of all sub-directories and common files (for combinFrom)
+#   shared  — optional shared config
+#   dev     — variantsTree of sibling sub-directories (subDirs only at this stage)
 
 { pkgs, inputs, shared ? {}, dev ? {}, ... }:
 {
-  # The "default" key produces shell name: "default"
-  # Additional keys produce: "rust", "go", etc.
+  # Shell name: "python-machine"
   default = {
-    shell = "zsh";
     buildInputs = with pkgs; [
-      git
-      curl
+      python3
+      python3Packages.numpy
+      python3Packages.scipy
+      python3Packages.matplotlib
+      zsh   # required in PATH for the shell override below
     ];
-
-    shellHook = ''
-      echo "Welcome to the default dev shell"
+    postInputsHook = ''
+      export MPLBACKEND=Agg
     '';
+    shellHook = ''
+      echo "Python ML shell — $(python3 --version)"
+    '';
+    # shell override: exec'd after all hooks, replaces the current process.
+    shell = "zsh";
   };
 }

@@ -1,24 +1,30 @@
-# @path: ~/projects/configs/nix-config/lib/dev/default.nix
-# @description: Example top-level dev shell definitions
-# This file is imported by pdshells.nix as the "default.nix" for the root dev directory.
-# It receives:
-#   pkgs    — nixpkgs
+# @path: test/dev/python/renpy/default.nix
+# @description: Ren'Py visual-novel engine shell — default.nix for dev/python/renpy/.
+#   Shell name: "python-renpy"
+#
+# Receives from pdshells:
+#   pkgs    — nixpkgs instance
 #   inputs  — flake inputs
-#   shared  — shared config passed to pdshells
-#   dev     — variantsTree of all sub-directories and common files (for combinFrom)
+#   shared  — optional shared config
+#   dev     — variantsTree of ancestor directories
 
 { pkgs, inputs, shared ? {}, dev ? {}, ... }:
 {
-  # The "default" key produces shell name: "default"
-  # Additional keys produce: "rust", "go", etc.
+  # Shell name: "python-renpy"
   default = {
     buildInputs = with pkgs; [
-      git
-      curl
+      python3
+      python3Packages.pygame-ce or python3Packages.pygame
+      SDL2
+      SDL2_image
+      SDL2_mixer
+      SDL2_ttf
     ];
-
+    preShellHook = ''
+      export SDL_VIDEODRIVER=''${SDL_VIDEODRIVER:-x11}
+    '';
     shellHook = ''
-      echo "Welcome to the default dev shell"
+      echo "Ren'Py dev shell — Python $(python3 -c 'import sys; print(sys.version.split()[0])')"
     '';
   };
 }

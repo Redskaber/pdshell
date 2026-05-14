@@ -1,24 +1,24 @@
 # pdshell — Architecture & Design Document
 
-> Version 2.1.0
+> Version 2.2.0
 
 ---
 
 ## 1. Principle-to-Implementation Mapping
 
-| Principle              | Where implemented                                                                    |
-| ---------------------- | ------------------------------------------------------------------------------------ |
-| Dependency Inversion   | `_resolveStrategy` / `_mergeStrategy` params; `FileProcessStrategy` contract         |
-| Pipeline Dataflow      | `\|>` throughout; all stages are `Context → Context`                                 |
-| Layered Architecture   | `pdshells`: subdirs → common → default; `mk-pdshell`: 7-stage pipeline               |
-| Incremental Mode       | Context grows per stage; never reset mid-pipeline                                    |
-| Strategy Management    | `resolveStrategy`, `mergeStrategy`, `FileProcessStrategy` first-class objects        |
-| State Machine          | `ContextPhase` enum; `validate.fn-assertPhase` at each stage entry                   |
-| Lifecycle Management   | 5 hook phases with guaranteed ordering and labelled shellHook sections               |
-| Boundary Clarity       | Public: `mkDevShell`, loader output; Internal: `validate`, `pipeline`, `layer`, `fs` |
-| Data-Driven            | All behaviour parameterised; protocol constants replace bare string literals         |
-| Communication Protocol | `Context` is the typed envelope; `LayerResult`/`FileResult` are typed outputs        |
-| Plugin / Hot-swap      | `combinFrom` = composable plugins; strategies injectable via named params            |
+| Principle              | Where implemented                                                                            |
+| ---------------------- | -------------------------------------------------------------------------------------------- |
+| Dependency Inversion   | `_resolveStrategy`, `_mergeStrategy`, `_hookComposeStrategy`; `FileProcessStrategy` contract |
+| Pipeline Dataflow      | `\|>` throughout; all stages are `Context → Context`                                         |
+| Layered Architecture   | `pdshells`: subdirs → common → default; `mk-pdshell`: 7-stage pipeline                       |
+| Incremental Mode       | Context grows per stage; never reset mid-pipeline                                            |
+| Strategy Management    | `resolveStrategy`, `mergeStrategy`, `hookComposeStrategy`, `FileProcessStrategy` first-class |
+| State Machine          | `ContextPhase` enum; `validate.fn-assertPhase` at each stage entry                           |
+| Lifecycle Management   | 5 hook phases with guaranteed ordering and labelled shellHook sections                       |
+| Boundary Clarity       | Public: `mkDevShell`, loader output; Internal: `validate`, `pipeline`, `layer`, `fs`         |
+| Data-Driven            | All behaviour parameterised; protocol constants replace bare string literals                 |
+| Communication Protocol | `Context` is the typed envelope; `LayerResult`/`FileResult` are typed outputs                |
+| Plugin / Hot-swap      | `combinFrom` = composable plugins; all three strategies injectable via named params          |
 
 ---
 
@@ -28,13 +28,13 @@
 pdshells.nix
     │
     ├── mk-pdshell.nix
-    │       ├── validate          (contracts)
-    │       ├── resolveStrategy   (pluggable)
-    │       ├── extractor         (pure)
-    │       ├── mergeStrategy     (pluggable)
-    │       ├── hookComposer      (pure)
-    │       ├── pipeline          (orchestrator)
-    │       └── protocols         (HookPhase, HookFnField, ContextPhase, ShellKey)
+    │       ├── validate                   (contracts)
+    │       ├── resolveStrategy            (pluggable)
+    │       ├── extractor                  (pure)
+    │       ├── mergeStrategy              (pluggable)
+    │       ├── hookComposer               (pure + pluggable default strategy)
+    │       ├── pipeline                   (orchestrator)
+    │       └── protocols                  (HookPhase, HookFnField, ContextPhase, ShellKey)
     │
     ├── validate   (local contracts)
     ├── naming     (pure)
@@ -73,8 +73,8 @@ Context { phase=INIT, args, resolvedCombin=[], extractedHooks=[], mergedInputs={
   │
   ▼  pipeline.fn-compose        → phase = COMPOSE
   │                               composedHooks = { preInputs, postInputs,
-  │                                                  preShell, postShell,
-  │                                                  inheritedShell }
+  │                                                  inheritedShell,
+  │                                                  preShell, postShell }
   │
   ▼  pipeline.fn-build          → phase = BUILD
   │                               mkShellParams = { name, buildInputs,
@@ -116,11 +116,28 @@ currentPath
 
 ---
 
-## 4. Protocol Definitions
+## 4. Hook Lifecycle
+
+The assembled `shellHook` sections appear in this guaranteed order:
+
+```
+# === PRE-INPUTS HOOK ===       ← before buildInputs activated
+# === POST-INPUTS HOOK ===      ← after  buildInputs activated
+# === INHERITED SHELLHOOK ===   ← combinFrom shellHooks + top-level shellHook
+# === PRE-SHELL HOOK ===        ← just before interactive shell
+# === POST-SHELL HOOK ===       ← at shell exit / cleanup
+# === FINAL SHELL OVERRIDE ===  ← exec <shell> (only if shell != null)
+```
+
+Empty sections are omitted entirely. Non-empty sections are separated by blank lines.
+
+---
+
+## 5. Protocol Definitions
 
 ### HookPhase (mk-pdshell.nix)
 
-Field names present on every normalised hook-config attrset.
+Keys present on every normalised hook-config attrset.
 Used as keys when reading from `extractedHooks` lists.
 
 ```
@@ -133,8 +150,8 @@ SHELL       = "shellHook"
 
 ### HookFnField (mk-pdshell.nix)
 
-Parallel structure to `HookPhase`. Field names for the optional dynamic hook
-functions supplied by the caller.
+Parallel structure to `HookPhase`. Field names for optional dynamic hook
+functions supplied by the caller (receive `{ pkgs }`).
 
 ```
 PRE_INPUTS  = "preInputsHookFn"
@@ -158,7 +175,7 @@ Common  — from any other .nix; file base IS part of the shell name
 
 ---
 
-## 5. Strategy Contracts
+## 6. Strategy Contracts
 
 ### Resolve Strategy
 
@@ -176,70 +193,68 @@ base:[pkg]  →  extracted:[pkg]  →  merged:[pkg]
 
 Deduplication policy is the strategy's responsibility.
 
+### Hook Compose Strategy
+
+```
+args:attrset  →  in:[hookAttrset]  →  resolvedCombin:[attrset]
+  →  { preInputs, postInputs, inheritedShell, preShell, postShell }
+```
+
+Default: `hookComposer.fn-defaultComposeStrategy`.
+Injected via `_hookComposeStrategy` parameter.
+
 ### FileProcessStrategy
 
 ```nix
 {
-  attrType              : AttrType
-  targetField           : string              # LayerContext field to update
-  fn-getFileList        : path → [string]     # which files to process
-  fn-getSubVariantsTree : LayerContext → attrset  # visible to the imported file
+  attrType                 : AttrType
+  targetField              : string                # LayerContext field to update
+  fn-getFileList           : path → suffix → [string]   # which files to process
+  fn-getSubVariantsTree    : LayerContext → attrset      # visible to the imported file
   fn-aggregateVariantsTree : [FileResult] → attrset
-  fn-validationContext  : path → string       # error message prefix
+  fn-validationContext     : path → string               # error message prefix
 }
 ```
 
 ---
 
-## 6. Key Design Decisions (v2.1)
+## 7. Key Design Decisions (v2.2)
 
-### Stage 5: no mk helper
+### Hook assembly order matches lifecycle documentation
 
-The original v2.0 introduced an `mk` helper to reduce repetition across the four
-hook phases. The helper took `phase`, `fnField`, and `customField` as arguments —
-but in the default case all three resolved to the same string value (e.g.
-`"preInputsHook"`). This hid the fact that they play **different semantic roles**:
+v2.1 assembled sections as `INHERITED → PRE-INPUTS → POST-INPUTS → PRE-SHELL → POST-SHELL`,
+contradicting the documented lifecycle order. v2.2 corrects `fn-assemble` to emit:
+`PRE-INPUTS → POST-INPUTS → INHERITED → PRE-SHELL → POST-SHELL`.
 
-| Arg           | Role                                          | Source                  |
-| ------------- | --------------------------------------------- | ----------------------- |
-| `hookName`    | Section label; key to look up inherited hooks | `HookPhase.*`           |
-| `fnFieldName` | Key for the optional Fn in args               | `HookFnField.*`         |
-| `customStr`   | The caller's string hook                      | `args.${HookPhase.*}`   |
-| `fn`          | The caller's dynamic Fn                       | `args.${HookFnField.*}` |
+### `_hookComposeStrategy` — third injectable strategy
 
-v2.1 restores the explicit per-phase blocks using `HookPhase.*` and `HookFnField.*`
-constants, making every argument's role immediately visible and preventing future
-confusion if phase names and fn-field names ever diverge.
+v2.1 inlined per-phase composition directly in `pipeline.fn-compose`. v2.2 extracts this
+into `hookComposer.fn-defaultComposeStrategy` and exposes it as `_hookComposeStrategy`.
+This makes hook composition independently testable and replaceable without touching the
+pipeline orchestrator. The default strategy is behaviourally identical to v2.1.
 
-### \_mkShellStripKeys includes name and extension-point keys
+### `fn-getFileList` now receives suffix
 
-`ShellKey.name` is stripped so `fn-build` can assign it exactly once in the `//`
-merge, avoiding silent duplicate-key shadowing.
+v2.1's `CommonStrategy.fn-getFileList` called `fs.fn-getAttrsFiles` which used the
+module-level `fs.default-nixSuffix` constant, ignoring the runtime `suffix` parameter.
+v2.2 threads `ctx.suffix` through `fn-execute` into every strategy call.
 
-`ShellKey._resolveStrategy` and `ShellKey._mergeStrategy` are stripped so that
-user-injected strategy functions never leak into `pkgs.mkShell`.
+### `shell` override is variant-level, not top-level-only
 
-### validPath forwarding in fn-processMain
+The prior claim that `shell` is "only honoured at the top level" was imprecise.
+`pdshells` builds shells by calling `mkDevShell (variantAttrset // { name = ...; })`.
+Any `shell` key in a variant attrset is therefore forwarded to `mkDevShell` and fully
+honoured. The `machine.nix` test file demonstrates this correctly.
 
-`validate.fn-assertFileExists` returns the validated path. v2.0 piped this result
-but then discarded it, passing the original `currentPath` to `fn-processDirectory`.
-v2.1 forwards `validPath` — the assertion result — ensuring the validated value is
-actually used.
+### Stage 5: no mk helper (unchanged from v2.1)
 
-### fn-processDirectory signature
-
-v2.0 accepted a `ctx` parameter but immediately discarded it (building a fresh
-context via `fn-initialContext`). Only `ctx.suffix` was used. v2.1 replaces `ctx`
-with an explicit `suffix` parameter, making the function signature honest.
-
-### Global uniqueness is now strictly evaluated
-
-v2.0 used a `let` binding that was never forced. v2.1 uses `assert` with `lib.seq`
-to guarantee the uniqueness check always runs before the shells are returned.
+The `fn-defaultComposeStrategy` uses a local `phase` helper (binding `hookName` and
+`fnField` together) which is scoped to the function and makes the parallel structure
+visible without conflating the three distinct semantic roles of the parameters.
 
 ---
 
-## 7. Error Taxonomy
+## 8. Error Taxonomy
 
 | Code                      | Module              | Cause                                     |
 | ------------------------- | ------------------- | ----------------------------------------- |

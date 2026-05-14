@@ -1,21 +1,21 @@
 # @path: ~/projects/configs/nix-config/lib/dev/pdshells.nix
 # @author: redskaber
-# @version: 2.1.0
+# @version: 2.2.0
 # @datetime: 2026-05-14
-# @description: lib::dev::pdshells - Dataflow-driven layered shell loader
+# @description: lib::dev::pdshells — Dataflow-driven layered shell loader
 #
 # == ARCHITECTURE PRINCIPLES ==
-# 1. Dependency Inversion   — modules depend on protocol contracts, not implementations
-# 2. Pipeline Dataflow      — |> left-to-right transforms; every stage returns new Context
-# 3. Layered Architecture   — recursive depth-first directory traversal with layer isolation
-# 4. Incremental Mode       — variantsTree grows incrementally; shells registered as discovered
-# 5. Strategy Management    — FileProcessStrategy is first-class pluggable object
-# 6. State Machine          — LayerContext transitions: SCAN → SUBDIRS → COMMON → DEFAULT → DONE
-# 7. Lifecycle Management   — subDirs processed before common files before default.nix
-# 8. Boundary Clarity       — public surface (pdshells) vs internal (fs / layer / validate)
-# 9. Data-Driven            — behaviour driven by directory contents, no hard-coded names
-# 10. Communication Protocol — Context/LayerResult are typed envelopes between stages
-# 11. Plugin / Hot-swap     — combinFrom entries are composable plugins; strategies are swappable
+#  1. Dependency Inversion   — modules depend on protocol contracts, not implementations
+#  2. Pipeline Dataflow      — |> left-to-right transforms; every stage returns a new Context
+#  3. Layered Architecture   — recursive depth-first traversal with per-directory isolation
+#  4. Incremental Mode       — variantsTree grows incrementally; shells registered as discovered
+#  5. Strategy Management    — FileProcessStrategy is a first-class pluggable record
+#  6. State Machine          — LayerContext transitions: SCAN → SUBDIRS → COMMON → DEFAULT → DONE
+#  7. Lifecycle Management   — subDirs processed before common files before default.nix
+#  8. Boundary Clarity       — public surface: pdshells output; internal: fs/layer/validate
+#  9. Data-Driven            — behaviour driven by directory contents; no hard-coded names
+# 10. Communication Protocol — LayerContext and LayerResult are typed envelopes
+# 11. Plugin / Hot-swap      — combinFrom entries are composable plugins; strategies are swappable
 
 
 { pkgs, inputs, devDir, shared ? {}, suffix ? ".nix", ... }:
@@ -24,9 +24,12 @@ let
   inherit (inputs.nix-types.enum) enum;
   inherit (import ./mk-pdshell.nix { inherit pkgs; }) mkDevShell;
 
-  # ── VALIDATION MODULE ─────────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════════
+  # §1  VALIDATION MODULE
+  # ════════════════════════════════════════════════════════════════════════════
 
   validate = {
+
     ## Assert value is an attrset (boundary check on imported .nix files).
     fn-assertAttrSet = context: value:
       if lib.isAttrs value then value
@@ -34,11 +37,11 @@ let
         INVALID STRUCTURE (${context}):
         • Expected : attrset
         • Got      : ${builtins.typeOf value}
-        Resolution : Ensure file returns an attrset like:
+        Resolution : Ensure the file returns an attrset, e.g.:
           { default = { buildInputs = [ ... ]; }; }
       '';
 
-    ## Assert all names are unique; throw with a resolution hint if not.
+    ## Assert all names are unique; throw with a resolution hint on conflict.
     fn-assertUniqueNames = context: names:
       (builtins.groupBy (x: x) names)
       |> (groups: lib.filterAttrs (_: g: builtins.length g > 1) groups)
@@ -49,9 +52,9 @@ let
           ${context} NAMING CONFLICT:
           • Duplicate identifiers: ${builtins.concatStringsSep ", " dupNames}
           Resolution: Follow naming protocol:
-            - default.nix variant 'X'  → [base]-X
-            - X.nix  variant 'default' → [base]-X  (AVOID if [base]-X exists)
-          Fix by renaming variants/files for global uniqueness.
+            - default.nix variant 'X'   → [base]-X
+            - X.nix  variant 'default'  → [base]-X  (avoid if [base]-X already exists)
+          Fix by renaming variants or files for global uniqueness.
         '');
 
     ## Assert a filesystem path exists (fail-fast at loader entry).
@@ -114,30 +117,34 @@ let
           else ctx);
   };
 
-  # ── NAMING STRATEGY MODULE ────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════════
+  # §2  NAMING MODULE
+  # ════════════════════════════════════════════════════════════════════════════
 
   naming = {
     default-variantName = "default";
     default-concat-sep  = "-";
 
-    ## Derive the canonical shell name from the hierarchy position.
+    ## Derive the canonical shell name from hierarchy position.
     ## Rules:
-    ##   • root basePath ("")      is omitted
-    ##   • Default attrType        omits fileBase (directory name is the identity)
-    ##   • variantName "default"   is omitted
-    ##   • Empty result falls back to "default"
+    ##   • root basePath ("")       is omitted
+    ##   • Default AttrType         omits fileBase (directory name is the identity)
+    ##   • variantName "default"    is omitted
+    ##   • Empty result falls back  to "default"
     fn-makeFullName = basePath: attrType: fileBase: variantName:
       ([
-        (if basePath    == fs.default-basePath          then null else basePath)
-        (if attrType    == fs.AttrType.Default          then null else fileBase)
-        (if variantName == naming.default-variantName   then null else variantName)
+        (if basePath    == fs.default-basePath         then null else basePath)
+        (if attrType    == fs.AttrType.Default         then null else fileBase)
+        (if variantName == naming.default-variantName  then null else variantName)
       ]
       |> lib.filter (x: x != null))
       |> lib.concatStringsSep naming.default-concat-sep
       |> (fullName: if fullName == "" then naming.default-variantName else fullName);
   };
 
-  # ── FILESYSTEM MODULE ─────────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════════
+  # §3  FILESYSTEM MODULE
+  # ════════════════════════════════════════════════════════════════════════════
 
   fs = {
     default-nix            = "default.nix";
@@ -145,17 +152,17 @@ let
     default-basePath       = "";
     default-fileBase       = "";
     default-private-prefix = "_";
-    default-nixSuffix      = ".nix";
+    default-nixSuffix      = ".nix";    # canonical suffix; module param `suffix` overrides at runtime
 
-    ## AttrType enum (contract-based, not bare string magic).
+    ## AttrType enum — contract-based, no bare strings.
     AttrType = enum "AttrType" [ "Default" "Common" ];
 
     ## Parameter protocol for every imported attr file.
     AttrFileParams = { pkgs, inputs ? {}, shared ? {}, dev ? {} } @ p: p;
 
-    # ── Pure path predicates ──────────────────────────────────────────────
+    # ── Pure path predicates ────────────────────────────────────────────────
     fn-isPrivate   = name: lib.hasPrefix fs.default-private-prefix name;
-    fn-isNixFile   = name: lib.hasSuffix fs.default-nixSuffix name;
+    fn-isNixFile   = suffix: name: lib.hasSuffix suffix name;
 
     fn-isType = expectedType: path: name:
       (builtins.readDir path).${name}
@@ -169,7 +176,7 @@ let
 
     fn-isAttrsFile = path: name:
       (fs.fn-isRegular path name)
-      && fs.fn-isNixFile name
+      && fs.fn-isNixFile fs.default-nixSuffix name
       && !fs.fn-isPrivate name;
 
     fn-listDir = path:
@@ -177,19 +184,22 @@ let
 
     fn-getAttrsDirs = path:
       fs.fn-listDir path
-      |> (entries: lib.filter (name: fs.fn-isAttrsDir  path name) entries);
+      |> (entries: lib.filter (name: fs.fn-isAttrsDir path name) entries);
 
-    fn-getAttrsFiles = path:
+    fn-getAttrsFiles = currentSuffix: path:
       fs.fn-listDir path
       |> (entries: lib.filter (name:
-            name != fs.default-nix && fs.fn-isAttrsFile path name) entries);
+            name != fs.default-nix
+            && fs.fn-isRegular path name
+            && fs.fn-isNixFile currentSuffix name
+            && !fs.fn-isPrivate name) entries);
 
     fn-hasDefaultAttrs = path:
       fs.fn-listDir path
       |> (entries: lib.any (name: name == fs.default-nix) entries);
 
-    fn-makeFileBase = suffix: fileName:
-      lib.removeSuffix suffix fileName;
+    fn-makeFileBase = currentSuffix: fileName:
+      lib.removeSuffix currentSuffix fileName;
 
     ## Read and validate attrs from a .nix file using the AttrFileParams protocol.
     fn-readFileAttrs = filePath: pkgs': inputs': variantsTree:
@@ -197,7 +207,7 @@ let
       |> (params: import filePath params)
       |> (vars: validate.fn-assertAttrSet "FILE CONTENT (${filePath})" vars);
 
-    ## Build flat { shellName = derivation; } map from one file's variantsTree.
+    ## Build a flat { shellName = derivation; } map from one file's variantsTree.
     fn-flatShellsMapAttrs' = basePath: attrType: fileBase: variantsTree:
       lib.mapAttrs' (variantName: attrsetCfg:
         (naming.fn-makeFullName basePath attrType fileBase variantName)
@@ -208,10 +218,13 @@ let
       ) variantsTree;
   };
 
-  # ── LAYER DATA STRUCTURES ─────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════════
+  # §4  LAYER DATA STRUCTURES
+  # ════════════════════════════════════════════════════════════════════════════
 
   layer = {
-    ## CommonAttrs — flat accumulator for shells, tree, and name registry.
+
+    ## CommonAttrs — flat accumulator for shells, variant tree, and name registry.
     CommonAttrs = { flatShells ? {}, variantsTree ? {}, shellNames ? [] }: {
       inherit flatShells variantsTree shellNames;
     };
@@ -232,10 +245,10 @@ let
     };
 
     ## Bootstrap a fresh LayerContext for a directory.
-    fn-initialContext = currentPath: basePath: suffix:
-      layer.Context { inherit currentPath basePath suffix; };
+    fn-initialContext = currentPath: basePath: currentSuffix:
+      layer.Context { inherit currentPath basePath; suffix = currentSuffix; };
 
-    ## LayerResult — final typed output of processing one directory.
+    ## LayerResult — final typed output for one directory.
     LayerResult = { path, flatShells, variantsTree, shellNames } @ p: p;
 
     ## FileResult — output of processing one .nix file.
@@ -265,26 +278,27 @@ let
         shellNames   = builtins.attrNames flatShells;
       in layer.FileResult { inherit fileBase flatShells variantsTree shellNames; };
 
-    # ── FILE PROCESS STRATEGY (plugin pattern) ──────────────────────────────
-    # Each strategy is a first-class record describing HOW to process a category of files.
+    # ── FILE PROCESS STRATEGY  (plugin pattern) ──────────────────────────────
+    # Each strategy is a first-class record describing HOW to process a file category.
     # New strategies can be added without modifying the core pipeline.
 
     FileProcessStrategy = {
+
       ## Strategy protocol (contract / interface definition).
       FileStrategy = {
-        attrType,                 # AttrType.Default | AttrType.Common
-        targetField,              # LayerContext field to update
-        fn-getFileList,           # currentPath → [ fileName ]
-        fn-getSubVariantsTree,    # LayerContext → variantsTree (visible to the imported file)
-        fn-aggregateVariantsTree, # [FileResult] → variantsTree
-        fn-validationContext,     # currentPath → string (error message prefix)
+        attrType,                  # AttrType.Default | AttrType.Common
+        targetField,               # LayerContext field to update
+        fn-getFileList,            # currentPath → suffix → [ fileName ]
+        fn-getSubVariantsTree,     # LayerContext → variantsTree (visible to the imported file)
+        fn-aggregateVariantsTree,  # [FileResult] → variantsTree
+        fn-validationContext,      # currentPath → string (error message prefix)
       } @ p: p;
 
       ## Common strategy: all non-default .nix files; sees only subDirs variantsTree.
       CommonStrategy = layer.FileProcessStrategy.FileStrategy {
         attrType              = fs.AttrType.Common;
         targetField           = "commonAttrs";
-        fn-getFileList        = currentPath: fs.fn-getAttrsFiles currentPath;
+        fn-getFileList        = currentPath: currentSuffix: fs.fn-getAttrsFiles currentSuffix currentPath;
         fn-getSubVariantsTree = ctx: ctx.subDirsAttrs.variantsTree;
         fn-validationContext  = currentPath: "COMMON ATTRS FILES(${currentPath})";
         fn-aggregateVariantsTree = fileResults:
@@ -295,7 +309,7 @@ let
       DefaultStrategy = layer.FileProcessStrategy.FileStrategy {
         attrType              = fs.AttrType.Default;
         targetField           = "defaultAttrs";
-        fn-getFileList        = currentPath:
+        fn-getFileList        = currentPath: _currentSuffix:
           if fs.fn-hasDefaultAttrs currentPath then [ fs.default-nix ] else [];
         fn-getSubVariantsTree = ctx:
           ctx.subDirsAttrs.variantsTree // ctx.commonAttrs.variantsTree;
@@ -306,7 +320,7 @@ let
       ## Execute a strategy against the current LayerContext.
       ## Returns ctx unchanged when there are no files to process.
       fn-execute = strategy: currentPath: basePath: ctx:
-        (strategy.fn-getFileList currentPath)
+        (strategy.fn-getFileList currentPath ctx.suffix)
         |> (files:
           if files == []
           then ctx
@@ -329,7 +343,7 @@ let
           ));
     };
 
-    # ── LAYER PIPELINE STAGES ──────────────────────────────────────────────
+    # ── LAYER PIPELINE STAGES ─────────────────────────────────────────────────
     # Processing order per directory:
     #   SUBDIRS (depth-first recursive) → COMMON files → DEFAULT file → DONE
 
@@ -366,11 +380,12 @@ let
         layer.FileProcessStrategy.DefaultStrategy currentPath basePath
         (ctx // { phase = "DEFAULT"; });
 
-    ## Full directory pipeline: bootstrap → validate → SUBDIRS → COMMON → DEFAULT → DONE → LayerResult.
+    ## Full directory pipeline:
+    ##   bootstrap → validate → SUBDIRS → COMMON → DEFAULT → conflict check → DONE → LayerResult
     ## Takes explicit (currentPath, basePath, path, suffix) — no ctx parameter.
     ## Each directory gets a fresh LayerContext for full isolation.
-    fn-processDirectory = currentPath: basePath: path: suffix:
-      (layer.fn-initialContext currentPath basePath suffix)
+    fn-processDirectory = currentPath: basePath: path: currentSuffix:
+      (layer.fn-initialContext currentPath basePath currentSuffix)
       |> validate.fn-assertStructuralValidation
       |> (layer.fn-processSubDirs     currentPath basePath)
       |> (layer.fn-processCommonAttrs currentPath basePath)
@@ -384,18 +399,21 @@ let
           shellNames   = ctx.subDirsAttrs.shellNames   ++ ctx.commonAttrs.shellNames   ++ ctx.defaultAttrs.shellNames;
         });
 
-    ## Entry-point: validate path existence, bootstrap suffix, delegate to fn-processDirectory.
+    ## Entry-point: validate path existence then delegate to fn-processDirectory.
     ## validPath (the return value of fn-assertFileExists) is forwarded — not discarded.
-    fn-processMain = currentPath: basePath: path: suffix:
+    fn-processMain = currentPath: basePath: path: currentSuffix:
       (validate.fn-assertFileExists currentPath)
-      |> (validPath: layer.fn-processDirectory validPath basePath path suffix);
+      |> (validPath: layer.fn-processDirectory validPath basePath path currentSuffix);
   };
 
-  # ── TOP-LEVEL EXECUTION ───────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════════
+  # §5  TOP-LEVEL EXECUTION
+  # ════════════════════════════════════════════════════════════════════════════
+
   rootResult = layer.fn-processMain devDir fs.default-basePath fs.default-path suffix;
 
   ## Global uniqueness guard: lib.seq forces strict evaluation so the check
-  ## always runs (not left as a lazy thunk that might never be forced).
+  ## always runs (never left as a lazy thunk that might be silently skipped).
   _global_unique_check =
     lib.seq
       (validate.fn-assertUniqueNames "GLOBAL NAMESPACE" rootResult.shellNames)
@@ -403,6 +421,6 @@ let
 
 in
   # Public surface: flat { shellName = derivation; ... }
-  # _global_unique_check is referenced to prevent dead-code elimination.
+  # _global_unique_check is referenced via assert to prevent dead-code elimination.
   assert _global_unique_check;
   rootResult.flatShells

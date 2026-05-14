@@ -1,6 +1,6 @@
 # pdshell — Pipeline-Driven Nix Dev Shell Manager
 
-> Version 2.1.0 · Nix · Pure functional · Zero side-effects
+> Version 2.2.0 · Nix · Pure functional · Zero side-effects
 
 ---
 
@@ -38,11 +38,11 @@
 
 | Principle              | Realisation                                                                           |
 | ---------------------- | ------------------------------------------------------------------------------------- |
-| Dependency Inversion   | `_resolveStrategy` / `_mergeStrategy` injection; `FileProcessStrategy` protocol       |
+| Dependency Inversion   | `_resolveStrategy`, `_mergeStrategy`, `_hookComposeStrategy`; `FileProcessStrategy`   |
 | Pipeline Dataflow      | `\|>` operators throughout; every stage is `Context → Context`                        |
 | Layered Architecture   | `mk-pdshell`: 7 explicit stages; `pdshells`: subdirs → common → default               |
 | Incremental Mode       | Context accumulates fields per stage; never reset mid-pipeline                        |
-| Strategy Management    | `resolveStrategy`, `mergeStrategy`, `FileProcessStrategy` first-class and swappable   |
+| Strategy Management    | All three strategies first-class and swappable without touching core                  |
 | State Machine          | `ContextPhase` / layer phase strings; `validate.fn-assertPhase` at each stage         |
 | Lifecycle Management   | 5 named hook phases with guaranteed ordering and labelled sections                    |
 | Boundary Clarity       | Public: `mkDevShell`, loader output; Internal: all other bindings                     |
@@ -55,23 +55,23 @@
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                          PUBLIC API                              │
-│   mkDevShell { ... }              pdshells { devDir; ... }       │
-└───────────────┬──────────────────────────┬───────────────────────┘
-                │                          │
-    ┌───────────▼──────────┐   ┌───────────▼───────────────────┐
-    │   mk-pdshell.nix     │   │        pdshells.nix           │
-    │   7-Stage Pipeline   │   │   Recursive Dir Loader        │
-    │                      │◄──│   (delegates to mkDevShell)   │
-    │  INIT                │   │                               │
-    │  RESOLVE ◄─strategy  │   │  SCAN → SUBDIRS               │
-    │  EXTRACT             │   │       → COMMON                │
-    │  MERGE   ◄─strategy  │   │       → DEFAULT → DONE        │
-    │  COMPOSE             │   │                               │
-    │  BUILD               │   └───────────────────────────────┘
-    │  EXEC                │
-    └──────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                            PUBLIC API                                │
+│   mkDevShell { ... }                pdshells { devDir; ... }         │
+└──────────────────┬───────────────────────────┬───────────────────────┘
+                   │                           │
+    ┌──────────────▼───────────┐   ┌───────────▼────────────────────┐
+    │    mk-pdshell.nix        │   │        pdshells.nix            │
+    │    7-Stage Pipeline      │   │   Recursive Dir Loader         │
+    │                          │◄──│   (delegates to mkDevShell)    │
+    │  INIT                    │   │                                │
+    │  RESOLVE ◄─resolveStrat  │   │  SCAN → SUBDIRS (depth-first)  │
+    │  EXTRACT                 │   │       → COMMON  (non-default)  │
+    │  MERGE   ◄─mergeStrat    │   │       → DEFAULT (default.nix)  │
+    │  COMPOSE ◄─hookCompose   │   │       → DONE                   │
+    │  BUILD                   │   │                                │
+    │  EXEC    → pkgs.mkShell  │   └────────────────────────────────┘
+    └──────────────────────────┘
 ```
 
 ---
@@ -81,8 +81,9 @@
 ```nix
 # flake.nix
 {
-  inputs.pdshell.url = "github:redskaber/pdshell";
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.pdshell.url   = "github:redskaber/pdshell";
+  inputs.nixpkgs.url   = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nix-types.url = "github:redskaber/nix-types";
 
   outputs = { self, nixpkgs, pdshell, ... }@inputs:
     let
@@ -91,7 +92,7 @@
     in {
       # Single shell via mkDevShell
       devShells.x86_64-linux.default = mkDevShell {
-        pkgs        = pkgs;
+        inherit pkgs;
         buildInputs = [ pkgs.git pkgs.curl ];
         shellHook   = "echo hello";
       };
@@ -111,9 +112,8 @@
 
 ```
 lib/dev/
-├── mk-pdshell.nix       # Shell constructor (v2.1)
-├── pdshells.nix         # Directory loader  (v2.1)
-└── default.nix          # Example root shell definitions
+├── mk-pdshell.nix       # Shell constructor
+└── pdshells.nix         # Directory loader
 
 dev/                     # Your shell definitions live here
 ├── default.nix          # → shell name: "default"
@@ -130,38 +130,39 @@ dev/                     # Your shell definitions live here
 ```nix
 mkDevShell {
   # ── Identity ────────────────────────────────────────────────────
-  name               ? "dev-shell",
+  name                  ? "dev-shell",
 
   # ── Inputs ──────────────────────────────────────────────────────
-  buildInputs        ? [],
-  nativeBuildInputs  ? [],
+  buildInputs           ? [],
+  nativeBuildInputs     ? [],
 
   # ── Plugin composition ──────────────────────────────────────────
-  combinFrom         ? [],        # list of shell-config attrsets to compose
+  combinFrom            ? [],        # list of shell-config attrsets to compose
 
   # ── Hook lifecycle (strings) ────────────────────────────────────
-  preInputsHook      ? "",        # before buildInputs activated
-  postInputsHook     ? "",        # after  buildInputs activated
-  preShellHook       ? "",        # just before interactive shell
-  postShellHook      ? "",        # at shell exit / cleanup
-  shellHook          ? "",        # raw mkShell-compatible hook (legacy)
+  preInputsHook         ? "",        # before buildInputs activated
+  postInputsHook        ? "",        # after  buildInputs activated
+  preShellHook          ? "",        # just before interactive shell
+  postShellHook         ? "",        # at shell exit / cleanup
+  shellHook             ? "",        # raw mkShell-compatible hook (legacy / inherited)
 
   # ── Hook lifecycle (functions) ──────────────────────────────────
   # Each *Fn receives { pkgs } and must return string | null.
-  preInputsHookFn    ? null,
-  postInputsHookFn   ? null,
-  preShellHookFn     ? null,
-  postShellHookFn    ? null,
+  preInputsHookFn       ? null,
+  postInputsHookFn      ? null,
+  preShellHookFn        ? null,
+  postShellHookFn       ? null,
 
   # ── Shell override ───────────────────────────────────────────────
   # exec'd AFTER all hooks; replaces the current process.
   # Must exist in PATH or be an absolute path.
-  # Only honoured at the top level (combinFrom entries ignored).
-  shell              ? null,
+  # Honoured at the variant level (pdshells passes variant attrsets to mkDevShell).
+  shell                 ? null,
 
   # ── Extension points (dependency inversion) ──────────────────────
-  _resolveStrategy   ? resolveStrategy.default,
-  _mergeStrategy     ? mergeStrategy.unique,
+  _resolveStrategy      ? resolveStrategy.default,
+  _mergeStrategy        ? mergeStrategy.unique,
+  _hookComposeStrategy  ? hookComposer.fn-defaultComposeStrategy,
 
   # Any extra attrs are forwarded verbatim to pkgs.mkShell
   ...
@@ -175,51 +176,63 @@ mkDevShell {
 ```
 shell enter
     │
-    ▼  preInputsHook / preInputsHookFn
+    ▼  preInputsHook / preInputsHookFn    ← PRE-INPUTS HOOK section
     │
-    │  (buildInputs / nativeBuildInputs activated)
+    │  (buildInputs / nativeBuildInputs activated by Nix)
     │
-    ▼  postInputsHook / postInputsHookFn
+    ▼  postInputsHook / postInputsHookFn  ← POST-INPUTS HOOK section
     │
-    ▼  INHERITED SHELLHOOK
-    │  (shellHook from all combinFrom entries + top-level shellHook)
+    ▼  INHERITED SHELLHOOK                ← shellHook from combinFrom entries
+    │                                        + top-level shellHook
     │
-    ▼  preShellHook / preShellHookFn
+    ▼  preShellHook / preShellHookFn      ← PRE-SHELL HOOK section
     │
-    ▼  postShellHook / postShellHookFn
+    ▼  postShellHook / postShellHookFn    ← POST-SHELL HOOK section
     │
-    ▼  [if shell != null]  exec <shell>
+    ▼  [if shell != null]  exec <shell>   ← FINAL SHELL OVERRIDE
 ```
 
 Generated `shellHook` sections are labelled for grep-ability:
 
 ```bash
-# === INHERITED SHELLHOOK ===
 # === PRE-INPUTS HOOK ===
+export CC=gcc
+
 # === POST-INPUTS HOOK ===
+export NODE_ENV=development
+
+# === INHERITED SHELLHOOK ===
+echo "from combinFrom"
+
 # === PRE-SHELL HOOK ===
+source .envrc
+
 # === POST-SHELL HOOK ===
+unset CC
+
 # === FINAL SHELL OVERRIDE ===
 exec zsh
 ```
+
+Empty sections are omitted entirely.
 
 ---
 
 ## Pipeline Stages
 
-| #   | FSM phase | Responsibility                                                 |
-| --- | --------- | -------------------------------------------------------------- |
-| 1   | `INIT`    | Wrap raw args in a typed `Context`                             |
-| 2   | `RESOLVE` | Unwrap `combinFrom` entries via the resolve strategy           |
-| 3   | `EXTRACT` | Normalise hook structures using `HookPhase` constants          |
-| 4   | `MERGE`   | Merge `buildInputs` / `nativeBuildInputs` via merge strategy   |
-| 5   | `COMPOSE` | Build all hook lifecycle phases — one explicit block per phase |
-| 6   | `BUILD`   | Assemble final `pkgs.mkShell` parameter set                    |
-| 7   | `EXEC`    | String validation + `pkgs.mkShell`                             |
+| #   | FSM phase | Responsibility                                                    |
+| --- | --------- | ----------------------------------------------------------------- |
+| 1   | `INIT`    | Wrap raw args in a typed `Context`                                |
+| 2   | `RESOLVE` | Unwrap `combinFrom` entries via the resolve strategy              |
+| 3   | `EXTRACT` | Normalise hook structures using `HookPhase` constants             |
+| 4   | `MERGE`   | Merge `buildInputs` / `nativeBuildInputs` via merge strategy      |
+| 5   | `COMPOSE` | Build all hook lifecycle phases via the hook compose strategy     |
+| 6   | `BUILD`   | Assemble final `pkgs.mkShell` parameter set; apply shell override |
+| 7   | `EXEC`    | String validation + `pkgs.mkShell`                                |
 
-Stage 5 uses **no shared helper** for the four hook phases: each phase is
-composed with fully-named parameters (`HookPhase.*` and `HookFnField.*`) to
-make the role of every argument unambiguous.
+Stage 5 is delegated to `_hookComposeStrategy` (default:
+`hookComposer.fn-defaultComposeStrategy`), which composes each phase with
+fully-named, role-distinct parameters (`HookPhase.*` and `HookFnField.*`).
 
 ---
 
@@ -271,8 +284,8 @@ HookFnField.POST_SHELL  = "postShellHookFn"
 ### ShellKey
 
 Single source of truth for every field name in shell-config attrsets and `args`.
-Also covers `_resolveStrategy` and `_mergeStrategy` so extension overrides are
-stripped from `args` before forwarding to `pkgs.mkShell`.
+Covers `_resolveStrategy`, `_mergeStrategy`, and `_hookComposeStrategy` so all
+extension overrides are stripped before forwarding to `pkgs.mkShell`.
 
 ---
 
@@ -286,14 +299,6 @@ Protocol: `entry:attrset → config:attrset`
 | ------------------------- | --------------------------------------------------- |
 | `resolveStrategy.default` | Unwrap `{ default = {...}; }` or use entry directly |
 
-Custom example:
-
-```nix
-_resolveStrategy = entry:
-  if builtins.hasAttr "shellConfig" entry then entry.shellConfig
-  else resolveStrategy.default entry;
-```
-
 ### Merge Strategy
 
 Protocol: `base:[pkg] → extracted:[pkg] → merged:[pkg]`
@@ -303,6 +308,14 @@ Protocol: `base:[pkg] → extracted:[pkg] → merged:[pkg]`
 | `mergeStrategy.unique`   | Concatenate + deduplicate (default)              |
 | `mergeStrategy.prepend`  | `combinFrom` items first, then base; deduplicate |
 | `mergeStrategy.baseOnly` | Ignore `combinFrom` inputs entirely              |
+
+### Hook Compose Strategy
+
+Protocol: `args → in:[hookAttrset] → resolvedCombin:[attrset] → composedPhases`
+
+| Name                                     | Behaviour                                |
+| ---------------------------------------- | ---------------------------------------- |
+| `hookComposer.fn-defaultComposeStrategy` | Explicit per-phase composition (default) |
 
 ---
 
@@ -344,17 +357,17 @@ Protocol: `base:[pkg] → extracted:[pkg] → merged:[pkg]`
 pdshells {
   inherit pkgs inputs;
   devDir  = ./dev;    # required
-  shared  = {};       # optional — forwarded to every file
-  suffix  = ".nix";  # optional
+  shared  = {};       # optional — forwarded to every imported file
+  suffix  = ".nix";  # optional — file extension filter (default: ".nix")
 }
 # → { shellName = <derivation>; ... }
 ```
 
 ### Global uniqueness
 
-Shell names are checked for uniqueness globally.
-Duplicate names cause a build-time `NAMING CONFLICT` error with a resolution hint.
-The check is strictly evaluated via `assert` — it cannot be silently skipped.
+Shell names are checked for uniqueness globally at evaluation time.
+Duplicate names cause a build-time `NAMING CONFLICT` error.
+The check is strictly evaluated via `assert lib.seq` — it cannot be silently skipped.
 
 ---
 
@@ -372,6 +385,8 @@ The check is strictly evaluated via `assert` — it cannot be silently skipped.
 ---
 
 ## Extension Guide
+
+Full details in [`docs/extension-guide.md`](docs/extension-guide.md).
 
 ### Swap the resolve strategy
 
@@ -391,6 +406,14 @@ mkDevShell {
 }
 ```
 
+### Swap the hook compose strategy
+
+```nix
+mkDevShell {
+  _hookComposeStrategy = myCompose;   # myCompose : args → in → resolvedCombin → phases
+}
+```
+
 ### Dynamic hook function
 
 ```nix
@@ -401,29 +424,40 @@ mkDevShell {
 }
 ```
 
+### Shell override at the variant level
+
+```nix
+# dev/python/machine.nix
+{ pkgs, ... }:
+{
+  default = {
+    buildInputs = [ pkgs.python3 pkgs.zsh ];
+    shell       = "zsh";   # exec'd after all hooks
+  };
+}
+```
+
 ### Org-wide defaults wrapper
 
 ```nix
-# lib/mkOrgShell.nix
-{ pkgs, mkDevShell, orgPkgs }:
-args:
-  mkDevShell ({
-    buildInputs    = [ pkgs.git pkgs.gnupg ];
-    _mergeStrategy = mergeStrategy.prepend;
-  } // args);
+args: mkDevShell ({
+  buildInputs    = [ pkgs.git pkgs.gnupg ];
+  _mergeStrategy = mergeStrategy.prepend;
+} // args);
 ```
 
 ### Access internals for testing
 
 ```nix
 let
-  subject = import ./lib/dev/mk-pdshell.nix { inherit pkgs; };
+  subject = import ./lib/mk-pdshell.nix { inherit pkgs; };
 in {
-  # Unit-test individual modules
-  test-resolve = subject.resolveStrategy.default
+  test-resolve      = subject.resolveStrategy.default
     { default = { buildInputs = [ pkgs.git ]; }; };
-  test-merge   = subject.mergeStrategy.unique [ pkgs.git ] [ pkgs.git pkgs.curl ];
-  test-shell   = subject.mkDevShell { buildInputs = [ pkgs.git ]; };
+  test-merge        = subject.mergeStrategy.unique [ pkgs.git ] [ pkgs.git pkgs.curl ];
+  test-hookCompose  = subject.hookComposer.fn-defaultComposeStrategy
+    { preInputsHook = "echo pre"; } [] [];
+  test-shell        = subject.mkDevShell { buildInputs = [ pkgs.git ]; };
 }
 ```
 
@@ -433,31 +467,32 @@ in {
 
 ### mkDevShell parameters
 
-| Parameter           | Type               | Default                   | Description             |
-| ------------------- | ------------------ | ------------------------- | ----------------------- |
-| `name`              | string             | `"dev-shell"`             | Derivation name prefix  |
-| `buildInputs`       | `[pkg]`            | `[]`                      | Runtime packages        |
-| `nativeBuildInputs` | `[pkg]`            | `[]`                      | Build-time packages     |
-| `combinFrom`        | `[attrset]`        | `[]`                      | Plugins to compose      |
-| `preInputsHook`     | string             | `""`                      | Hook before inputs      |
-| `postInputsHook`    | string             | `""`                      | Hook after inputs       |
-| `preShellHook`      | string             | `""`                      | Hook before shell       |
-| `postShellHook`     | string             | `""`                      | Hook after shell        |
-| `shellHook`         | string             | `""`                      | Raw mkShell-compat hook |
-| `*HookFn`           | `{pkgs}→str\|null` | `null`                    | Dynamic hook functions  |
-| `shell`             | string\|null       | `null`                    | Final shell override    |
-| `_resolveStrategy`  | function           | `resolveStrategy.default` | combinFrom resolver     |
-| `_mergeStrategy`    | function           | `mergeStrategy.unique`    | Input merge algorithm   |
+| Parameter              | Type               | Default                                  | Description                      |
+| ---------------------- | ------------------ | ---------------------------------------- | -------------------------------- |
+| `name`                 | string             | `"dev-shell"`                            | Derivation name prefix           |
+| `buildInputs`          | `[pkg]`            | `[]`                                     | Runtime packages                 |
+| `nativeBuildInputs`    | `[pkg]`            | `[]`                                     | Build-time packages              |
+| `combinFrom`           | `[attrset]`        | `[]`                                     | Plugins to compose               |
+| `preInputsHook`        | string             | `""`                                     | Hook before inputs               |
+| `postInputsHook`       | string             | `""`                                     | Hook after inputs                |
+| `preShellHook`         | string             | `""`                                     | Hook before shell                |
+| `postShellHook`        | string             | `""`                                     | Hook after shell                 |
+| `shellHook`            | string             | `""`                                     | Raw mkShell-compat / legacy hook |
+| `*HookFn`              | `{pkgs}→str\|null` | `null`                                   | Dynamic hook functions           |
+| `shell`                | string\|null       | `null`                                   | Final shell override             |
+| `_resolveStrategy`     | function           | `resolveStrategy.default`                | combinFrom resolver              |
+| `_mergeStrategy`       | function           | `mergeStrategy.unique`                   | Input merge algorithm            |
+| `_hookComposeStrategy` | function           | `hookComposer.fn-defaultComposeStrategy` | Hook composition algorithm       |
 
 ### pdshells parameters
 
-| Parameter | Type    | Required      | Description               |
-| --------- | ------- | ------------- | ------------------------- |
-| `pkgs`    | nixpkgs | yes           | nixpkgs instance          |
-| `inputs`  | attrset | yes           | Flake inputs              |
-| `devDir`  | path    | yes           | Root of shell definitions |
-| `shared`  | attrset | no            | Forwarded to every file   |
-| `suffix`  | string  | no (`".nix"`) | File extension filter     |
+| Parameter | Type    | Required      | Description                                  |
+| --------- | ------- | ------------- | -------------------------------------------- |
+| `pkgs`    | nixpkgs | yes           | nixpkgs instance                             |
+| `inputs`  | attrset | yes           | Flake inputs                                 |
+| `devDir`  | path    | yes           | Root of shell definitions                    |
+| `shared`  | attrset | no            | Forwarded to every imported file as `shared` |
+| `suffix`  | string  | no (`".nix"`) | File extension filter                        |
 
 ---
 
@@ -467,10 +502,10 @@ in {
 | ---------------------------- | ------------------------------------------- | ------------------------------------ |
 | `PHASE VIOLATION`            | Stage called out of order                   | Use pipeline in documented order     |
 | `HOOK CONTRACT VIOLATION`    | `*HookFn` returned wrong type               | Return `string \| null` only         |
-| `INVALID COMBIN ENTRY`       | No shell keys in entry                      | Add `buildInputs`, `shellHook`, etc. |
+| `INVALID COMBIN ENTRY`       | No shell keys in combinFrom entry           | Add `buildInputs`, `shellHook`, etc. |
 | `NAMING CONFLICT`            | Two shells resolve to the same name         | Rename variants or files             |
 | `KEY COLLISION`              | `defaultAttrs` conflicts with existing tree | Rename variants in `default.nix`     |
 | `STRUCTURAL AMBIGUITY`       | `foo.nix` and `foo/` coexist                | Keep only one source per base name   |
 | `EMPTY DIRECTORY`            | No `.nix` files and no sub-dirs             | Add a shell or remove the directory  |
 | `PATH NOT FOUND`             | `devDir` doesn't exist                      | Verify `devDir` path                 |
-| Shell not found after `exec` | Binary not in PATH                          | Add shell to `buildInputs`           |
+| Shell not found after `exec` | Binary not in `$PATH` at hook time          | Add shell package to `buildInputs`   |
