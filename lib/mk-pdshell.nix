@@ -336,7 +336,7 @@ let
         ${hookStr}
 
         # === FINAL SHELL OVERRIDE ===
-        if [ -n "''${IN_NIX_SHELL:-}" ]; then
+        if [ -t 0 ]; then
           exec ${shellOverride}
         fi
       ''
