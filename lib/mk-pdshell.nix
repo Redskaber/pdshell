@@ -336,10 +336,7 @@ let
         ${hookStr}
 
         # === FINAL SHELL OVERRIDE ===
-        # Skip exec when running inside direnv evaluation context.
-        # $DIRENV_DIR is set by direnv during shellHook evaluation;
-        # executing a new shell here would cause infinite reload loops.
-        if [ -z "''${DIRENV_DIR:-}" ]; then
+        if [ -n "''${IN_NIX_SHELL:-}" ]; then
           exec ${shellOverride}
         fi
       ''
