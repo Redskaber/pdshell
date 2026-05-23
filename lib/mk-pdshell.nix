@@ -331,7 +331,15 @@ let
     ## exec replaces the current process — must come after all other hooks.
     fn-applyShellOverride = shellOverride: hookStr:
       if shellOverride != null
-      then hookStr + "\n\n# === FINAL SHELL OVERRIDE ===\nexec ${shellOverride}"
+      then
+      ''
+        ${hookStr}
+
+        # === FINAL SHELL OVERRIDE ===
+        if [ -z "$DIRENV_ACTIVE" ]; then
+          exec ${shellOverride}
+        fi
+      ''
       else hookStr;
   };
 
