@@ -336,7 +336,8 @@ let
         ${hookStr}
 
         # === FINAL SHELL OVERRIDE ===
-        if [ -z "$DIRENV_ACTIVE" ]; then
+        if [ -z "''${_PDSHELL_ACTIVE:-}" ]; then
+          export _PDSHELL_ACTIVE=1
           exec ${shellOverride}
         fi
       ''
