@@ -336,9 +336,10 @@ let
         ${hookStr}
 
         # === FINAL SHELL OVERRIDE ===
-        if [ -t 0 ]; then
-          exec ${shellOverride}
-        fi
+        # Export SHELL so the user's preferred shell is used when entering
+        # interactive sessions (nix develop). Under direnv, SHELL is read
+        # by the terminal emulator / multiplexer — no exec needed.
+        export SHELL="$(command -v ${shellOverride})"
       ''
       else hookStr;
   };
