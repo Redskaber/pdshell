@@ -336,8 +336,10 @@ let
         ${hookStr}
 
         # === FINAL SHELL OVERRIDE ===
-        if [ -z "''${_PDSHELL_ACTIVE:-}" ]; then
-          export _PDSHELL_ACTIVE=1
+        # Skip exec when running inside direnv evaluation context.
+        # $DIRENV_DIR is set by direnv during shellHook evaluation;
+        # executing a new shell here would cause infinite reload loops.
+        if [ -z "''${DIRENV_DIR:-}" ]; then
           exec ${shellOverride}
         fi
       ''
