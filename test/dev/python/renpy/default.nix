@@ -23,8 +23,8 @@
     preShellHook = ''
       export SDL_VIDEODRIVER=''${SDL_VIDEODRIVER:-x11}
     '';
-    shellHook = ''
-      echo "Ren'Py dev shell — Python $(python3 -c 'import sys; print(sys.version.split()[0])')"
+    postShellHook = ''
+      echo "inputs: ${inputs.nix-types.outPath}"
     '';
   };
 }

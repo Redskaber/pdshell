@@ -1,8 +1,8 @@
-# @path: ~/projects/configs/nix-config/lib/dev/mk-pdshell.nix
+# @path: lib/mk-pdshell.nix
 # @author: redskaber
-# @version: 2.4.0
+# @version: 2.5.0
 # @datetime: 2026-05-24
-# @description: lib::dev::mk-pdshell — Pipeline-driven Nix dev shell constructor
+# @description: lib::mk-pdshell — Pipeline-driven Nix dev shell constructor
 #
 # == ARCHITECTURE PRINCIPLES ==
 #  1. Dependency Inversion   — all modules depend on protocol contracts, not concretions
@@ -10,28 +10,34 @@
 #  3. Layered Architecture   — validate → protocol → strategy → extract → merge → compose → build → exec
 #  4. Incremental Mode       — each stage enriches Context; never reset mid-pipeline
 #  5. Strategy Management    — resolve, merge, hookCompose strategies are first-class and swappable
-#  6. State Machine          — Context.phase transitions INIT→RESOLVE→EXTRACT→MERGE→COMPOSE→BUILD→EXEC
+#  6. State Machine          — Context.phase: INIT→RESOLVE→EXTRACT→MERGE→COMPOSE→BUILD→EXEC
 #  7. Lifecycle Management   — preInputs → postInputs → inheritedShell → preShell → postShell
 #  8. Boundary Clarity       — public: mkDevShell; internal: validate/strategy/pipeline/*
 #  9. Data-Driven            — all behaviour parameterised via protocol constants; no bare strings
 # 10. Communication Protocol — Context is the single typed envelope flowing between stages
 # 11. Plugin / Hot-swap      — combinFrom = composable plugins; all strategies injectable
 #
+# == CHANGELOG v2.5.0 ==
+#  [F1] pkgs parameter boundary correction
+#       • mkDevShell signature: `pkgs` is now a REQUIRED parameter with no default value.
+#         The previous `pkgs ? pkgs` was a self-referential default causing infinite recursion
+#         when pkgs was not supplied by the caller.
+#       • Callers (notably pdshells.fn-buildFlatShells) must inject pkgs explicitly.
+#         This makes the dependency boundary unambiguous: the caller owns pkgs, not the module.
+#       • The module-level `pkgs` (from `{ pkgs, ... }:`) is still used internally for
+#         `pkgs.lib`, `pkgs.mkShell` fallback, and hook composition — but it is now
+#         SEPARATE from the per-shell `pkgs` that callers may override.
+#       • Behavioural contract: if the caller does not pass pkgs in the shell attrset,
+#         the module-level pkgs is used as the authoritative source (via pipeline.fn-exec).
+#         This preserves backward compatibility for direct mkDevShell users who rely on
+#         the module-level pkgs implicitly.
+#
 # == CHANGELOG v2.4.0 ==
 #  [D1] hookComposer: eliminated implicit `pkgs` closure capture
-#       • `fn-executeHookFn` now receives `pkgs'` as an explicit first argument
-#       • `fn-composePhase`  now receives `pkgs'` as an explicit first argument
-#       • `fn-defaultComposeStrategy` receives `pkgs'` from the pipeline
-#       • `pipeline.fn-compose` extracts `pkgs` from `ctx.args` (it is always
-#         present because mkDevShell is called as `{ pkgs, ... }`)  ← single DI root
-#       This mirrors the RuntimeEnv pattern in pdshells: one explicit source,
-#       threaded through the pipeline rather than captured at definition time.
-#
-#  [E1] debug mode for hookComposer.fn-assemble
-#       • New optional parameter `_debug ? false` on mkDevShell
-#       • When true, empty lifecycle sections are emitted as
-#         `# === PHASE === (empty)` instead of being dropped, aiding diagnosis
-#       • `_debug` is added to `_mkShellStripKeys` so it never reaches pkgs.mkShell
+#       • fn-executeHookFn / fn-composePhase / fn-defaultComposeStrategy now receive
+#         pkgs' as an explicit first argument
+#       • pipeline.fn-compose extracts pkgs from ctx.args (falls back to module pkgs)
+#  [E1] debug mode: _debug ? false — empty hook sections kept as `# === PHASE === (empty)`
 
 { pkgs, ... }:
 let
@@ -88,6 +94,7 @@ let
     preShellHookFn         = "preShellHookFn";
     postShellHookFn        = "postShellHookFn";
     name                   = "name";
+    pkgs                   = "pkgs";
     combinFrom             = "combinFrom";
     shell                  = "shell";
     _resolveStrategy       = "_resolveStrategy";
@@ -97,10 +104,9 @@ let
   };
 
   ## Keys stripped from args before forwarding to pkgs.mkShell.
-  ##   ShellKey.name            — stripped so fn-build assigns it exactly once
-  ##   ShellKey._*Strategy      — extension overrides; not valid pkgs.mkShell params
-  ##   Hook string/fn fields    — consumed by the pipeline; must not reach mkShell
+  ## `pkgs` is stripped here — pkgs.mkShell does not accept a pkgs argument.
   _mkShellStripKeys = [
+    ShellKey.pkgs
     ShellKey.name
     ShellKey.combinFrom
     ShellKey.preInputsHook    ShellKey.postInputsHook
@@ -146,7 +152,7 @@ let
 
     ## Assert hook function result is string or null.
     fn-assertHookResult = fnFieldName: result:
-      if result == null         then ""
+      if result == null          then ""
       else if lib.isString result then result
       else throw ''
         HOOK CONTRACT VIOLATION (${fnFieldName}):
@@ -259,10 +265,7 @@ let
 
     ## Ignore combinFrom packages — base list is authoritative.
     baseOnly = base: _extracted: base;
-
-    ## Dispatcher — applies the chosen strategy to (base, extracted).
-    fn-mergeInputs = strategy: base: extracted:
-      strategy base extracted;
+    fn-mergeInputs = strategy: base: extracted: strategy base extracted;
   };
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -270,35 +273,26 @@ let
   #     Lifecycle-aware hook composition with labelled, grep-friendly sections.
   #
   #     LIFECYCLE ORDER:
-  #       PRE-INPUTS HOOK
-  #       POST-INPUTS HOOK
-  #       INHERITED SHELLHOOK   ← combinFrom shellHooks + top-level shellHook
-  #       PRE-SHELL HOOK
-  #       POST-SHELL HOOK
-  #       [FINAL SHELL OVERRIDE]
+  #       PRE-INPUTS HOOK  →  POST-INPUTS HOOK  →  INHERITED SHELLHOOK
+  #       →  PRE-SHELL HOOK  →  POST-SHELL HOOK  →  [FINAL SHELL OVERRIDE]
   #
-  #  v2.4: `pkgs` is no longer captured from the outer module closure.
-  #        It is passed as an explicit argument through the composition chain:
-  #          fn-executeHookFn pkgs' fnFieldName fn
-  #          fn-composePhase  pkgs' hookName fnFieldName inheritedList customStr fn
-  #          fn-defaultComposeStrategy pkgs' args inh resolvedCombin
-  #        This eliminates the last implicit dependency on the module scope.
+  #     pkgs' resolution:
+  #       pipeline.fn-compose extracts pkgs from ctx.args when present
+  #       (injected by pdshells via fn-buildFlatShells), otherwise falls back
+  #       to the module-level pkgs.  This supports both usage modes:
+  #         • via pdshells   → pkgs injected from runtimeEnv
+  #         • direct call    → pkgs from module parameter
   # ════════════════════════════════════════════════════════════════════════════
 
   hookComposer = {
 
-    ## Execute an optional dynamic hook function.
-    ##
-    ## v2.4: `pkgs'` is an explicit parameter — no closure capture.
-    ##   Protocol: pkgs' → fnFieldName → fn → string
+    ## Protocol: pkgs' → fnFieldName → fn → string
     fn-executeHookFn = pkgs': fnFieldName: fn:
       (fn == null)
       |> (isNull: if isNull then "" else fn { pkgs = pkgs'; })
       |> (result: validate.fn-assertHookResult fnFieldName result);
 
-    ## Compose one lifecycle phase from three ordered sources.
-    ##
-    ## v2.4: `pkgs'` threaded through to fn-executeHookFn.
+    ## Protocol: pkgs' → hookName → fnFieldName → inheritedList → customStr → fn → string
     fn-composePhase = pkgs': hookName: fnFieldName: inheritedList: customStr: fn:
       inheritedList
       |> lib.concatStringsSep "\n"
@@ -306,10 +300,7 @@ let
                    + "\n" + (hookComposer.fn-executeHookFn pkgs' fnFieldName fn))
       |> lib.strings.trim;
 
-    ## Default hookCompose strategy.
-    ##
-    ## v2.4: receives `pkgs'` as first argument; passes it into every fn-composePhase call.
-    ##   Protocol: pkgs' → args → inh → resolvedCombin → composedPhases
+    ## Protocol: pkgs' → args → inh → resolvedCombin → composedPhases
     fn-defaultComposeStrategy = pkgs': args: inh: resolvedCombin:
       let
         phase = hookName: fnField:
@@ -318,22 +309,21 @@ let
             hookName
             fnField
             (map (h: h.${hookName}) inh)
-            (args.${hookName}  or "")
-            (args.${fnField}   or null);
+            (args.${hookName} or "")
+            (args.${fnField}  or null);
       in {
         preInputs  = phase HookPhase.PRE_INPUTS  HookFnField.PRE_INPUTS;
         postInputs = phase HookPhase.POST_INPUTS HookFnField.POST_INPUTS;
         preShell   = phase HookPhase.PRE_SHELL   HookFnField.PRE_SHELL;
         postShell  = phase HookPhase.POST_SHELL  HookFnField.POST_SHELL;
         inheritedShell =
-          (extractor.fn-extractField HookPhase.SHELL resolvedCombin
+          extractor.fn-extractField HookPhase.SHELL resolvedCombin
           |> lib.concatStringsSep "\n"
           |> (s: s + "\n" + (args.${HookPhase.SHELL} or ""))
-          |> lib.strings.trim);
+          |> lib.strings.trim;
       };
 
-    ## Wrap non-empty content in a labelled section header.
-    ## In debug mode, empty sections are emitted as `# === LABEL === (empty)`.
+    ## In debug mode, empty sections become `# === LABEL === (empty)` instead of "".
     fn-buildSection = debug: label: content:
       if content != ""
       then "# === ${label} ===\n${content}"
@@ -345,11 +335,11 @@ let
     ## Empty sections are omitted (or labelled in debug mode).
     fn-assemble = debug: { preInputs, postInputs, inheritedShell, preShell, postShell }:
       [
-        (hookComposer.fn-buildSection debug "PRE-INPUTS HOOK"      preInputs)
-        (hookComposer.fn-buildSection debug "POST-INPUTS HOOK"     postInputs)
-        (hookComposer.fn-buildSection debug "INHERITED SHELLHOOK"  inheritedShell)
-        (hookComposer.fn-buildSection debug "PRE-SHELL HOOK"       preShell)
-        (hookComposer.fn-buildSection debug "POST-SHELL HOOK"      postShell)
+        (hookComposer.fn-buildSection debug "PRE-INPUTS HOOK"     preInputs)
+        (hookComposer.fn-buildSection debug "POST-INPUTS HOOK"    postInputs)
+        (hookComposer.fn-buildSection debug "INHERITED SHELLHOOK" inheritedShell)
+        (hookComposer.fn-buildSection debug "PRE-SHELL HOOK"      preShell)
+        (hookComposer.fn-buildSection debug "POST-SHELL HOOK"     postShell)
       ]
       |> lib.filter (s: s != "")
       |> lib.concatStringsSep "\n\n";
@@ -357,8 +347,7 @@ let
     ## Append `export SHELL=...` at the very end of the assembled shellHook.
     fn-applyShellOverride = shellOverride: hookStr:
       if shellOverride != null
-      then
-      ''
+      then ''
         ${hookStr}
 
         # === FINAL SHELL OVERRIDE ===
@@ -450,17 +439,16 @@ let
 
     ## Stage 5: COMPOSE
     ##
-    ## v2.4: extracts `pkgs` from ctx.args (always present — mkDevShell requires it)
-    ## and passes it as the first argument to the hookComposeStrategy.
-    ## The strategy protocol is now:
-    ##   pkgs' → args → inh → resolvedCombin → composedPhases
+    ## pkgs' resolution — explicit DI with graceful fallback:
+    ##   1. ctx.args.pkgs  — injected by pdshells (preferred, makes source traceable)
+    ##   2. pkgs           — module-level pkgs from { pkgs, ... }: (direct-call compat)
+    ##
+    ## Protocol: hookComposeStrat pkgs' args inh resolvedCombin → composedPhases
     fn-compose = hookComposeStrat: ctx:
       validate.fn-assertPhase ContextPhase.MERGE ctx
       |> (ctx:
         let
-          ## pkgs is always present in ctx.args: mkDevShell's module parameter
-          ## `{ pkgs, ... } @ args` guarantees it — no fallback needed.
-          pkgs' = ctx.args.pkgs;
+          pkgs' = ctx.args.pkgs or pkgs;
         in
         hookComposeStrat pkgs' ctx.args ctx.extractedHooks ctx.resolvedCombin
         |> (composed: ctx // {
@@ -497,21 +485,41 @@ let
         }
       );
 
-    # ── Stage 7: EXEC ────────────────────────────────────────────────────────
-    # Final type validation then delegate to pkgs.mkShell.
+    ## fn-exec uses the per-shell pkgs (ctx.args.pkgs) when available,
+    ## falling back to module-level pkgs — same resolution as fn-compose.
     fn-exec = ctx:
       validate.fn-assertPhase ContextPhase.BUILD ctx
       |> (ctx:
+        let pkgs' = ctx.args.pkgs or pkgs;
+        in
         validate.fn-assertString "FINAL SHELLHOOK" ctx.mkShellParams.shellHook
         |> (_: ctx // { phase = ContextPhase.EXEC; })
-        |> (ctx: pkgs.mkShell ctx.mkShellParams)
+        |> (_: pkgs'.mkShell ctx.mkShellParams)
       );
   };
 
   # ════════════════════════════════════════════════════════════════════════════
   # §9  PUBLIC API — mkDevShell
   #
-  #     All parameters are optional; sane defaults are provided.
+  #     REQUIRED PARAMETERS
+  #     ────────────────────
+  #     pkgs                  — nixpkgs instance; no default (must be supplied by caller)
+  #                             When called via pdshells, injected from runtimeEnv.pkgs.
+  #                             When called directly, supply the desired nixpkgs instance.
+  #
+  #     OPTIONAL PARAMETERS
+  #     ────────────────────
+  #     name                  — shell derivation name (default: "dev-shell")
+  #     buildInputs           — runtime packages (default: [])
+  #     nativeBuildInputs     — build-time packages (default: [])
+  #     combinFrom            — list of composable shell configs (default: [])
+  #     preInputsHook  / Fn   — hook before buildInputs activated
+  #     postInputsHook / Fn   — hook after  buildInputs activated
+  #     shellHook             — legacy-compat hook (merged into inheritedShell)
+  #     preShellHook   / Fn   — hook just before interactive shell
+  #     postShellHook  / Fn   — hook at shell exit / cleanup
+  #     shell                 — export SHELL=<shell>; executed last
+  #     _debug                — emit (empty) markers for unused lifecycle sections
   #
   #     EXTENSION POINTS (dependency inversion)
   #     ────────────────────────────────────────
@@ -543,7 +551,7 @@ let
   # ════════════════════════════════════════════════════════════════════════════
 
   mkDevShell = {
-    pkgs                  ? pkgs,
+    pkgs,                               # REQUIRED — no default; caller must supply
     name                  ? "dev-shell",
     buildInputs           ? [],
     nativeBuildInputs     ? [],

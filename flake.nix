@@ -21,6 +21,7 @@
         # ── Test shells from the test/dev directory ───────────────────────────
         testShells = pdshells {
           inherit pkgs;
+          inputs = inputs;
           devDir = ./test/dev;
           shared = {};
         };
