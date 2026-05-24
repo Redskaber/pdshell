@@ -22,13 +22,13 @@
       "locked": {
         "lastModified": 1774805688,
         "narHash": "sha256-+rx2OtuPQI7A4SKot3M1j1GiiJzSWrkEB9V8s8zdEPA=",
-        "owner": "redskaber",
+        "owner": "Redskaber",
         "repo": "nix-types",
         "rev": "439e85b219441d3d3475b6cffd78061217175c89",
         "type": "github"
       },
       "original": {
-        "owner": "redskaber",
+        "owner": "Redskaber",
         "repo": "nix-types",
         "type": "github"
       }

@@ -1,7 +1,7 @@
 # @path: ~/projects/configs/nix-config/lib/dev/pdshells.nix
 # @author: redskaber
-# @version: 2.2.0
-# @datetime: 2026-05-14
+# @version: 2.3.0
+# @datetime: 2026-05-24
 # @description: lib::dev::pdshells — Dataflow-driven layered shell loader
 #
 # == ARCHITECTURE PRINCIPLES ==
@@ -16,6 +16,28 @@
 #  9. Data-Driven            — behaviour driven by directory contents; no hard-coded names
 # 10. Communication Protocol — LayerContext and LayerResult are typed envelopes
 # 11. Plugin / Hot-swap      — combinFrom entries are composable plugins; strategies are swappable
+#
+# == CHANGELOG v2.3.0 ==
+#  BUG FIX — Dependency Injection for `inputs` and `shared`
+#
+#  Root cause: `fs.fn-readFileAttrs` captured `shared` from the *module closure*
+#  rather than threading it explicitly through the FileContext envelope.
+#  Consequence: any call-site that constructs pdshells via `shared.pdshells { … }`
+#  but whose `shared` value differs from the one visible at import-time would
+#  silently receive a stale/empty attrset — causing `attribute 'unrpyc' missing`
+#  and similar "attribute X missing on inputs" errors.
+#
+#  Fix strategy (Dependency Inversion + Communication Protocol):
+#   • `RuntimeEnv` — a new explicit protocol record carrying { pkgs, inputs, shared }.
+#     It is constructed ONCE at the top level and threaded through every layer/file
+#     context without implicit closure capture.
+#   • `FileContext`  gains `runtimeEnv` field; `fn-initialFileResult` reads from it.
+#   • `fs.fn-readFileAttrs` receives `runtimeEnv` (not separate pkgs/inputs args)
+#     so it can never silently fall back to a stale closure.
+#   • `fs.AttrFileParams` default values for `inputs` and `shared` are REMOVED to
+#     make missing propagation a hard evaluation error rather than a silent default.
+#   • `layer.fn-processMain` accepts `runtimeEnv` and forwards it through the entire
+#     pipeline — no stage invents its own copy.
 
 
 { pkgs, inputs, devDir, shared ? {}, suffix ? ".nix", ... }:
@@ -23,6 +45,33 @@ let
   lib = pkgs.lib;
   inherit (inputs.nix-types.enum) enum;
   inherit (import ./mk-pdshell.nix { inherit pkgs; }) mkDevShell;
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # §0  RUNTIME ENVIRONMENT  (Communication Protocol — DI root)
+  #
+  #     Single explicit record assembled once from the module parameters and
+  #     threaded through every downstream context.  No stage may capture
+  #     `pkgs`, `inputs`, or `shared` from the outer closure — all access
+  #     must go through `runtimeEnv`.
+  #
+  #     This makes dependency injection explicit, testable, and hot-swappable.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  RuntimeEnv = {
+    ## Constructor / validator — ensures required fields are present.
+    ## Extra fields are accepted (open record) to allow future extension.
+    mk = { pkgs, inputs, shared, ... } @ env:
+      if !lib.isAttrs env
+        then throw "RuntimeEnv.mk: expected attrset, got ${builtins.typeOf env}"
+      else if !lib.isAttrs inputs
+        then throw "RuntimeEnv.mk: `inputs` must be an attrset (flake inputs), got ${builtins.typeOf inputs}"
+      else if !lib.isAttrs shared
+        then throw "RuntimeEnv.mk: `shared` must be an attrset, got ${builtins.typeOf shared}"
+      else { inherit pkgs inputs shared; };
+  };
+
+  ## The single RuntimeEnv instance for this pdshells invocation.
+  runtimeEnv = RuntimeEnv.mk { inherit pkgs inputs shared; };
 
   # ════════════════════════════════════════════════════════════════════════════
   # §1  VALIDATION MODULE
@@ -152,13 +201,22 @@ let
     default-basePath       = "";
     default-fileBase       = "";
     default-private-prefix = "_";
-    default-nixSuffix      = ".nix";    # canonical suffix; module param `suffix` overrides at runtime
+    default-nixSuffix      = ".nix";
 
     ## AttrType enum — contract-based, no bare strings.
     AttrType = enum "AttrType" [ "Default" "Common" ];
 
     ## Parameter protocol for every imported attr file.
-    AttrFileParams = { pkgs, inputs ? {}, shared ? {}, dev ? {} } @ p: p;
+    ##
+    ## BREAKING CHANGE from v2.2: `inputs` and `shared` no longer have
+    ## default values.  They must be supplied explicitly — the absence of
+    ## a default surfaces propagation bugs as hard evaluation errors rather
+    ## than silent empty-attrset substitutions.
+    ##
+    ## The record is open (`@ p: p`) to remain forward-compatible with
+    ## future extension fields without breaking existing shell files that
+    ## use `{ pkgs, inputs, shared, ... }` destructuring.
+    AttrFileParams = { pkgs, inputs, shared, dev ? {} } @ p: p;
 
     # ── Pure path predicates ────────────────────────────────────────────────
     fn-isPrivate   = name: lib.hasPrefix fs.default-private-prefix name;
@@ -202,8 +260,16 @@ let
       lib.removeSuffix currentSuffix fileName;
 
     ## Read and validate attrs from a .nix file using the AttrFileParams protocol.
-    fn-readFileAttrs = filePath: pkgs': inputs': variantsTree:
-      (fs.AttrFileParams { pkgs = pkgs'; inputs = inputs'; inherit shared; dev = variantsTree; })
+    ##
+    ## v2.3: receives `runtimeEnv` (not separate pkgs/inputs args) — explicit DI.
+    ## `dev` is the accumulated variantsTree visible to this file at import time.
+    fn-readFileAttrs = filePath: runtimeEnv': variantsTree:
+      (fs.AttrFileParams {
+        pkgs   = runtimeEnv'.pkgs;
+        inputs = runtimeEnv'.inputs;
+        shared = runtimeEnv'.shared;
+        dev    = variantsTree;
+      })
       |> (params: import filePath params)
       |> (vars: validate.fn-assertAttrSet "FILE CONTENT (${filePath})" vars);
 
@@ -231,22 +297,29 @@ let
 
     ## LayerContext — state machine envelope for processing one directory.
     ## Phases: SCAN → SUBDIRS → COMMON → DEFAULT → DONE
+    ##
+    ## v2.3: `runtimeEnv` field added — carries the DI root through every stage.
     Context = {
       currentPath,
       basePath,
+      runtimeEnv,
       suffix        ? fs.default-nixSuffix,
       phase         ? "SCAN",
       subDirsAttrs  ? layer.CommonAttrs {},
       commonAttrs   ? layer.CommonAttrs {},
       defaultAttrs  ? layer.CommonAttrs {},
     }: {
-      inherit currentPath basePath suffix phase
+      inherit currentPath basePath runtimeEnv suffix phase
               subDirsAttrs commonAttrs defaultAttrs;
     };
 
     ## Bootstrap a fresh LayerContext for a directory.
-    fn-initialContext = currentPath: basePath: currentSuffix:
-      layer.Context { inherit currentPath basePath; suffix = currentSuffix; };
+    fn-initialContext = currentPath: basePath: currentSuffix: runtimeEnv':
+      layer.Context {
+        inherit currentPath basePath;
+        suffix     = currentSuffix;
+        runtimeEnv = runtimeEnv';
+      };
 
     ## LayerResult — final typed output for one directory.
     LayerResult = { path, flatShells, variantsTree, shellNames } @ p: p;
@@ -255,43 +328,49 @@ let
     FileResult = { fileBase, flatShells, variantsTree, shellNames } @ p: p;
 
     ## FileContext — input contract for processing a single .nix file.
+    ##
+    ## v2.3: `inputs` and `pkgs` fields REMOVED in favour of `runtimeEnv`.
+    ##   Rationale: keeping them as separate fields caused accidental shadowing
+    ##   and made it possible to pass inconsistent pkgs/inputs combinations.
+    ##   A single `runtimeEnv` field makes the dependency boundary unambiguous.
     FileContext = {
       currentPath,
       basePath,
       attrType,
       fileName,
       subVariantsTree,
-      inputs,
+      runtimeEnv,
       suffix  ? fs.default-nixSuffix,
-      pkgs    ? pkgs,
     }: {
-      inherit currentPath basePath attrType fileName subVariantsTree inputs suffix pkgs;
+      inherit currentPath basePath attrType fileName subVariantsTree runtimeEnv suffix;
     };
 
     ## Process one .nix file: read → flatten → register.
+    ##
+    ## v2.3: reads pkgs from `fileCtx.runtimeEnv` — no implicit closure capture.
     fn-initialFileResult = fileCtx:
       let
         fileBase     = fs.fn-makeFileBase fileCtx.suffix fileCtx.fileName;
         filePath     = "${fileCtx.currentPath}/${fileCtx.fileName}";
-        variantsTree = fs.fn-readFileAttrs filePath fileCtx.pkgs fileCtx.inputs fileCtx.subVariantsTree;
-        flatShells   = fs.fn-flatShellsMapAttrs' fileCtx.basePath fileCtx.attrType fileBase variantsTree;
+        variantsTree = fs.fn-readFileAttrs filePath fileCtx.runtimeEnv fileCtx.subVariantsTree;
+        flatShells   = fs.fn-flatShellsMapAttrs'
+                         fileCtx.basePath fileCtx.attrType fileBase variantsTree;
         shellNames   = builtins.attrNames flatShells;
       in layer.FileResult { inherit fileBase flatShells variantsTree shellNames; };
 
     # ── FILE PROCESS STRATEGY  (plugin pattern) ──────────────────────────────
     # Each strategy is a first-class record describing HOW to process a file category.
-    # New strategies can be added without modifying the core pipeline.
 
     FileProcessStrategy = {
 
       ## Strategy protocol (contract / interface definition).
       FileStrategy = {
-        attrType,                  # AttrType.Default | AttrType.Common
-        targetField,               # LayerContext field to update
-        fn-getFileList,            # currentPath → suffix → [ fileName ]
-        fn-getSubVariantsTree,     # LayerContext → variantsTree (visible to the imported file)
-        fn-aggregateVariantsTree,  # [FileResult] → variantsTree
-        fn-validationContext,      # currentPath → string (error message prefix)
+        attrType,
+        targetField,
+        fn-getFileList,
+        fn-getSubVariantsTree,
+        fn-aggregateVariantsTree,
+        fn-validationContext,
       } @ p: p;
 
       ## Common strategy: all non-default .nix files; sees only subDirs variantsTree.
@@ -319,6 +398,8 @@ let
 
       ## Execute a strategy against the current LayerContext.
       ## Returns ctx unchanged when there are no files to process.
+      ##
+      ## v2.3: propagates `ctx.runtimeEnv` into every FileContext — no implicit captures.
       fn-execute = strategy: currentPath: basePath: ctx:
         (strategy.fn-getFileList currentPath ctx.suffix)
         |> (files:
@@ -326,9 +407,10 @@ let
           then ctx
           else (
             map (fileName: layer.fn-initialFileResult (layer.FileContext {
-              inherit currentPath basePath pkgs inputs fileName;
+              inherit currentPath basePath fileName;
               attrType        = strategy.attrType;
               suffix          = ctx.suffix;
+              runtimeEnv      = ctx.runtimeEnv;               # ← explicit DI
               subVariantsTree = strategy.fn-getSubVariantsTree ctx;
             })) files
             |> (fileResults: layer.CommonAttrs {
@@ -344,10 +426,10 @@ let
     };
 
     # ── LAYER PIPELINE STAGES ─────────────────────────────────────────────────
-    # Processing order per directory:
-    #   SUBDIRS (depth-first recursive) → COMMON files → DEFAULT file → DONE
 
     ## Stage 1/4: Recursively process sub-directories (depth-first).
+    ##
+    ## v2.3: passes `runtimeEnv` from ctx into every recursive call explicitly.
     fn-processSubDirs = currentPath: basePath: ctx:
       (fs.fn-getAttrsDirs currentPath)
       |> (dirPaths: map (path:
@@ -356,7 +438,7 @@ let
                         then path
                         else "${basePath}-${path}";
             in layer.fn-processDirectory
-                 "${currentPath}/${path}" newBase path ctx.suffix
+                 "${currentPath}/${path}" newBase path ctx.suffix ctx.runtimeEnv
           ) dirPaths)
       |> (layerResults: layer.CommonAttrs {
           flatShells   = lib.foldl' (acc: r: acc // r.flatShells)   {} layerResults;
@@ -368,24 +450,23 @@ let
         })
       |> (attrs: ctx // { phase = "SUBDIRS"; subDirsAttrs = attrs; });
 
-    ## Stage 2/4: Process common .nix files (see only subDirs variantsTree).
+    ## Stage 2/4: Process common .nix files.
     fn-processCommonAttrs = currentPath: basePath: ctx:
       layer.FileProcessStrategy.fn-execute
         layer.FileProcessStrategy.CommonStrategy currentPath basePath
         (ctx // { phase = "COMMON"; });
 
-    ## Stage 3/4: Process default.nix (sees subDirs + common variantsTrees).
+    ## Stage 3/4: Process default.nix.
     fn-processDefaultAttrs = currentPath: basePath: ctx:
       layer.FileProcessStrategy.fn-execute
         layer.FileProcessStrategy.DefaultStrategy currentPath basePath
         (ctx // { phase = "DEFAULT"; });
 
-    ## Full directory pipeline:
-    ##   bootstrap → validate → SUBDIRS → COMMON → DEFAULT → conflict check → DONE → LayerResult
-    ## Takes explicit (currentPath, basePath, path, suffix) — no ctx parameter.
-    ## Each directory gets a fresh LayerContext for full isolation.
-    fn-processDirectory = currentPath: basePath: path: currentSuffix:
-      (layer.fn-initialContext currentPath basePath currentSuffix)
+    ## Full directory pipeline.
+    ##
+    ## v2.3: `runtimeEnv'` is now an explicit parameter — no closure capture.
+    fn-processDirectory = currentPath: basePath: path: currentSuffix: runtimeEnv':
+      (layer.fn-initialContext currentPath basePath currentSuffix runtimeEnv')
       |> validate.fn-assertStructuralValidation
       |> (layer.fn-processSubDirs     currentPath basePath)
       |> (layer.fn-processCommonAttrs currentPath basePath)
@@ -400,27 +481,29 @@ let
         });
 
     ## Entry-point: validate path existence then delegate to fn-processDirectory.
-    ## validPath (the return value of fn-assertFileExists) is forwarded — not discarded.
-    fn-processMain = currentPath: basePath: path: currentSuffix:
+    ##
+    ## v2.3: `runtimeEnv'` threaded through — single DI root.
+    fn-processMain = currentPath: basePath: path: currentSuffix: runtimeEnv':
       (validate.fn-assertFileExists currentPath)
-      |> (validPath: layer.fn-processDirectory validPath basePath path currentSuffix);
+      |> (validPath: layer.fn-processDirectory validPath basePath path currentSuffix runtimeEnv');
   };
 
   # ════════════════════════════════════════════════════════════════════════════
   # §5  TOP-LEVEL EXECUTION
   # ════════════════════════════════════════════════════════════════════════════
 
-  rootResult = layer.fn-processMain devDir fs.default-basePath fs.default-path suffix;
+  rootResult = layer.fn-processMain
+    devDir
+    fs.default-basePath
+    fs.default-path
+    suffix
+    runtimeEnv;          # ← the single RuntimeEnv instance, assembled at §0
 
-  ## Global uniqueness guard: lib.seq forces strict evaluation so the check
-  ## always runs (never left as a lazy thunk that might be silently skipped).
   _global_unique_check =
     lib.seq
       (validate.fn-assertUniqueNames "GLOBAL NAMESPACE" rootResult.shellNames)
       true;
 
 in
-  # Public surface: flat { shellName = derivation; ... }
-  # _global_unique_check is referenced via assert to prevent dead-code elimination.
   assert _global_unique_check;
   rootResult.flatShells
