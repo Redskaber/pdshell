@@ -83,7 +83,7 @@
 }:
 let
   lib = pkgs.lib;
-  inherit (inputs.nix-types.enum) enum;
+  inherit (inputs.nix-types.lib) enum;
   inherit (import ./mk-pdshell.nix { inherit pkgs; }) mkDevShell;
 
   # ════════════════════════════════════════════════════════════════════════════
